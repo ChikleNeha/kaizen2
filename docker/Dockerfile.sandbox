@@ -1,0 +1,119 @@
+# =============================================================================
+# Kaizen OS — Sandbox Container
+# =============================================================================
+# Provides an isolated execution environment for agent actions.
+# The container has NO network access (--network=none at runtime),
+# limited CPU (--cpus=0.5) and memory (--memory=128m).
+#
+# Build:
+#   docker build -f docker/Dockerfile.sandbox -t kaizen-sandbox:latest .
+#
+# The SandboxExecutor in environment/sandbox.py launches this container
+# automatically when use_docker=True and Docker is available.
+# For the hackathon demo, simulated mode is used by default.
+# =============================================================================
+
+FROM python:3.11-slim
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir psutil pydantic>=2.0.0
+
+# ---------------------------------------------------------------------------
+# Working directory
+# ---------------------------------------------------------------------------
+WORKDIR /sandbox
+
+# ---------------------------------------------------------------------------
+# Copy only the files needed for sandbox execution
+# ---------------------------------------------------------------------------
+COPY environment/sandbox.py     ./sandbox.py
+COPY environment/action_space.py ./action_space.py
+
+# ---------------------------------------------------------------------------
+# Sandbox dispatch entry point
+# ---------------------------------------------------------------------------
+# The SandboxExecutor calls:
+#   docker run --rm --network=none --memory=128m --cpus=0.5 \
+#     kaizen-sandbox:latest \
+#     python -c "import sys, json, sandbox; \
+#                d=json.load(sys.stdin); \
+#                print(json.dumps(sandbox.dispatch(d['action'], d['obs'])))"
+#
+# The dispatch() function below is the public API expected by _DockerSandbox.
+# It is defined here rather than in sandbox.py to keep the container
+# entry point self-contained.
+# ---------------------------------------------------------------------------
+
+RUN cat > /sandbox/dispatch.py << 'PYEOF'
+"""
+dispatch.py
+Entry point called by the Docker sandbox executor.
+Reads action + obs JSON from stdin, executes the action, writes result to stdout.
+"""
+import sys
+import json
+
+# Add sandbox dir to path so imports resolve
+sys.path.insert(0, '/sandbox')
+
+from action_space import ACTION_MAP, AgenticOSAction
+from pydantic import ValidationError
+from sandbox import SandboxExecutor
+
+_executor = SandboxExecutor(use_docker=False)  # simulated inside container
+
+
+def dispatch(action_dict: dict, obs: dict) -> dict:
+    """Parse action dict and execute it against the observation."""
+    tool_name = action_dict.get('tool_name', '')
+    if tool_name not in ACTION_MAP:
+        return {
+            'success': False,
+            'message': f"Unknown tool_name: {tool_name}",
+            'obs_delta': {},
+        }
+    try:
+        action = ACTION_MAP[tool_name].model_validate(action_dict)
+    except ValidationError as exc:
+        return {
+            'success': False,
+            'message': f"Validation error: {exc}",
+            'obs_delta': {},
+        }
+    return _executor.execute(action, obs)
+
+
+if __name__ == '__main__':
+    payload = json.load(sys.stdin)
+    result  = dispatch(payload['action'], payload['obs'])
+    print(json.dumps(result))
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Default CMD — waits for stdin JSON and dispatches
+# ---------------------------------------------------------------------------
+CMD ["python", "/sandbox/dispatch.py"]
+
+# ---------------------------------------------------------------------------
+# Security hardening
+# ---------------------------------------------------------------------------
+# Run as non-root user to reduce blast radius
+RUN useradd -m -u 1000 sandbox
+USER sandbox
+
+# ---------------------------------------------------------------------------
+# Labels
+# ---------------------------------------------------------------------------
+LABEL org.opencontainers.image.title="Kaizen OS Sandbox"
+LABEL org.opencontainers.image.description="Isolated action executor for Kaizen OS agent"
+LABEL org.opencontainers.image.version="1.0.0"
