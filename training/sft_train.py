@@ -1,16 +1,6 @@
 """
 training/sft_train.py
 Supervised Fine-Tuning (SFT) for the Kaizen OS agent using Unsloth + LoRA.
-
-FIXES vs original:
-  1. Saves loss_curve.png to disk (required by judges — committed to repo)
-  2. Uses processing_class= instead of tokenizer= for TRL 0.12+ compatibility
-  3. Pins safe TRL usage pattern
-
-Run on Google Colab T4:
-    !pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-    !pip install trl==0.12.2 datasets accelerate bitsandbytes matplotlib
-    !python training/sft_train.py
 """
 
 import json
@@ -35,8 +25,11 @@ BATCH_SIZE       = 2
 GRAD_ACCUM       = 4
 LEARNING_RATE    = 2e-4
 MAX_STEPS        = 100
-OUTPUT_DIR       = "./kaizen_sft_model"
-LOSS_PLOT_PATH   = "./loss_curve.png"   # judges require this committed to repo
+LOSS_PLOT_PATH   = "./loss_curve.png"
+
+# FIX: use absolute path from env var so GRPO can find it reliably,
+# fall back to /workspace default so it's never a stray relative path.
+OUTPUT_DIR = os.environ.get("SFT_OUTPUT_DIR", "/workspace/kaizen_sft_model")
 
 DATASET_PATH = os.path.join(os.path.dirname(__file__), "golden_examples.json")
 
@@ -62,17 +55,14 @@ def _check_imports():
             missing.append(pkg)
     if missing:
         print(f"[SFT] Missing packages: {missing}")
-        print("[SFT] Install with:")
-        print('  pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"')
-        print("  pip install trl==0.12.2 datasets accelerate bitsandbytes matplotlib")
         sys.exit(1)
 
 _check_imports()
 
-from unsloth import FastLanguageModel          # type: ignore
-from datasets import Dataset                   # type: ignore
-from trl import SFTTrainer                     # type: ignore
-from transformers import TrainingArguments     # type: ignore
+from unsloth import FastLanguageModel
+from datasets import Dataset
+from trl import SFTTrainer
+from transformers import TrainingArguments
 import torch
 
 
@@ -100,16 +90,12 @@ def formatting_func(examples: dict, eos_token: str) -> list[str]:
 
 
 def save_loss_plot(log_history: list[dict], path: str) -> None:
-    """
-    Save training loss curve to disk.
-    Required by judges: loss_curve.png must be committed to the repo.
-    """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        steps = [entry["step"] for entry in log_history if "loss" in entry]
+        steps  = [entry["step"] for entry in log_history if "loss" in entry]
         losses = [entry["loss"] for entry in log_history if "loss" in entry]
 
         if not steps:
@@ -118,7 +104,6 @@ def save_loss_plot(log_history: list[dict], path: str) -> None:
 
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(steps, losses, color="#4ade80", linewidth=1.5, label="Training loss")
-
         ax.set_facecolor("#0f0f0f")
         fig.patch.set_facecolor("#0f0f0f")
         ax.tick_params(colors="#888888")
@@ -127,16 +112,13 @@ def save_loss_plot(log_history: list[dict], path: str) -> None:
         ax.set_ylabel("Loss", color="#888888")
         ax.set_title("Kaizen OS — SFT Loss Curve", color="#e2e2e2", pad=12)
         ax.legend(facecolor="#161616", labelcolor="#e2e2e2", framealpha=0.8)
-
         plt.tight_layout()
-        plt.savefig(path, dpi=150, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
+        plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close()
         print(f"[SFT] Loss curve saved to: {path}")
         print(f"[SFT] >>> Commit {path} to your repo before submission <<<")
 
     except ImportError:
-        # Save raw data as JSON fallback
         json_path = path.replace(".png", "_loss.json")
         data = {entry["step"]: entry["loss"] for entry in log_history if "loss" in entry}
         with open(json_path, "w") as f:
@@ -156,9 +138,6 @@ def train():
     print(f"[SFT] Max steps    : {MAX_STEPS}")
     print(f"[SFT] Output dir   : {OUTPUT_DIR}")
 
-    # ------------------------------------------------------------------
-    # 1. Load base model
-    # ------------------------------------------------------------------
     print("\n[SFT] Loading base model...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
@@ -181,7 +160,7 @@ def train():
         loftq_config=None,
     )
 
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params    = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"[SFT] Parameters: {total_params / 1e9:.2f}B total, "
@@ -189,19 +168,13 @@ def train():
         f"({100 * trainable_params / total_params:.2f}%)"
     )
 
-    # ------------------------------------------------------------------
-    # 2. Dataset
-    # ------------------------------------------------------------------
     print("\n[SFT] Preparing dataset...")
-    dataset = load_dataset_from_json(DATASET_PATH)
+    dataset  = load_dataset_from_json(DATASET_PATH)
     eos_token = tokenizer.eos_token
 
     def _fmt(examples):
         return formatting_func(examples, eos_token)
 
-    # ------------------------------------------------------------------
-    # 3. Training arguments
-    # ------------------------------------------------------------------
     training_args = TrainingArguments(
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
@@ -220,13 +193,8 @@ def train():
         save_strategy="no",
     )
 
-    # ------------------------------------------------------------------
-    # 4. SFTTrainer
-    # FIX: use processing_class= instead of tokenizer= for TRL 0.12+
-    # ------------------------------------------------------------------
     print("[SFT] Initialising SFTTrainer...")
 
-    # Detect TRL version to use correct parameter name
     import trl as _trl
     _trl_version = tuple(int(x) for x in _trl.__version__.split(".")[:2])
     _use_processing_class = _trl_version >= (0, 12)
@@ -248,9 +216,6 @@ def train():
 
     trainer = SFTTrainer(**trainer_kwargs)
 
-    # ------------------------------------------------------------------
-    # 5. Train
-    # ------------------------------------------------------------------
     print("\n[SFT] Starting training...")
     if torch.cuda.is_available():
         gpu_stats = torch.cuda.get_device_properties(0)
@@ -266,23 +231,14 @@ def train():
     print(f"[SFT] Runtime : {trainer_stats.metrics.get('train_runtime', 0):.0f}s")
     print(f"[SFT] Final loss: {trainer_stats.metrics.get('train_loss', 0):.4f}")
 
-    # ------------------------------------------------------------------
-    # 6. Save loss curve (REQUIRED by judges)
-    # ------------------------------------------------------------------
     print(f"\n[SFT] Saving loss curve to {LOSS_PLOT_PATH}...")
     save_loss_plot(trainer.state.log_history, LOSS_PLOT_PATH)
 
-    # ------------------------------------------------------------------
-    # 7. Save LoRA adapter
-    # ------------------------------------------------------------------
     print(f"\n[SFT] Saving LoRA adapter to {OUTPUT_DIR}...")
     model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     print(f"[SFT] Adapter saved.")
 
-    # ------------------------------------------------------------------
-    # 8. Optional HF Hub push
-    # ------------------------------------------------------------------
     hf_repo = os.environ.get("HF_REPO_ID", "")
     if hf_repo:
         print(f"\n[SFT] Pushing adapter to HuggingFace Hub: {hf_repo}")

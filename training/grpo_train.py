@@ -2,15 +2,18 @@
 training/grpo_train.py
 GRPO Reinforcement Learning for the Kaizen OS agent.
 
-FIXES vs original:
-  1. Uses processing_class= instead of tokenizer= for TRL 0.12+ compat
-  2. use_vllm= wrapped in try/except for TRL version safety
-  3. reward_fn now passes chaos_resolved=True to compute_reward()
-     so the +3.0 chaos-resolved bonus actually fires during training
-  4. save_steps=20 checkpoint saves added (safe recovery if crash)
-
-Run AFTER sft_train.py:
-    !python training/grpo_train.py
+FIXES applied:
+  1. MODEL_PATH now reads KAIZEN_SFT_PATH env var (matches run_training.sh)
+     and falls back to the correct absolute path /workspace/kaizen_sft_model
+  2. OUTPUT_DIR now reads GRPO_OUTPUT_DIR env var and falls back to an
+     absolute path — relative paths caused saves to a stray location
+  3. reward_fn now calls parse_action() before env.step() so the env
+     receives the correct dict format, not raw text
+  4. chaos_was_active is now actually passed to compute_reward() so the
+     +3.0 chaos-resolved bonus fires correctly during training
+  5. HF push no longer appends -grpo suffix (run_training.sh owns that
+     responsibility) — prevents the double-suffix bug (-sft-grpo-grpo)
+  6. save_steps wrapped in try/except so older GRPOConfig doesn't crash
 """
 
 import unsloth  # noqa: F401 — must be first
@@ -25,13 +28,17 @@ import traceback
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_PATH      = os.environ.get("KAIZEN_SFT_PATH", "./kaizen_sft_model")
+# FIX 1: env var name now matches what run_training.sh exports (KAIZEN_SFT_PATH)
+MODEL_PATH      = os.environ.get("KAIZEN_SFT_PATH", "/workspace/kaizen_sft_model")
+
+# FIX 2: absolute fallback so adapter is always findable by the push step
+OUTPUT_DIR      = os.environ.get("GRPO_OUTPUT_DIR", "/workspace/kaizen_grpo_model")
+
 GROUP_SIZE      = 4
 MAX_NEW_TOKENS  = 256
 KL_COEF         = 0.1
 LEARNING_RATE   = 5e-6
 MAX_STEPS       = 80
-OUTPUT_DIR      = "./kaizen_grpo_model"
 BATCH_SIZE      = 1
 GRAD_ACCUM      = 4
 SEED            = 42
@@ -57,16 +64,15 @@ def _check_imports():
 
 _check_imports()
 
-from unsloth import FastLanguageModel          # type: ignore
-from trl import GRPOTrainer, GRPOConfig        # type: ignore
-from datasets import Dataset                   # type: ignore
+from unsloth import FastLanguageModel
+from trl import GRPOTrainer, GRPOConfig
+from datasets import Dataset
 import torch
 import trl as _trl
 
 _trl_version = tuple(int(x) for x in _trl.__version__.split(".")[:2])
 _use_processing_class = _trl_version >= (0, 12)
 
-# Add project root to sys.path for environment imports
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -83,7 +89,6 @@ from environment.reward import compute_reward
 _reward_history: list[float] = []
 _step_counter: int = 0
 
-# One shared env — broadcast=False avoids needing a running WebSocket server
 _env = KaizenEnv(broadcast=False)
 
 
@@ -95,18 +100,17 @@ def reward_fn(completions: list, **kwargs) -> list[float]:
     """
     Reward function called by GRPOTrainer for each group of completions.
 
-    FIX: Now passes chaos_resolved to compute_reward() so the +3.0
-    chaos-resolved bonus fires correctly during training.
+    FIX 3: parse_action() is called before env.step() so the env gets a
+    proper action dict rather than raw completion text.
 
-    Without this fix, the model trains on reward signals that are missing
-    the most important bonus, causing it to undervalue chaos resolution.
+    FIX 4: chaos_was_active is now passed to compute_reward() so the +3.0
+    chaos-resolved bonus actually fires during training.
     """
     global _step_counter
     rewards: list[float] = []
 
     for completion in completions:
         try:
-            # Handle both string and message-dict formats
             if isinstance(completion, list):
                 completion_text = completion[-1]["content"] if completion else ""
             elif isinstance(completion, dict):
@@ -114,11 +118,9 @@ def reward_fn(completions: list, **kwargs) -> list[float]:
             else:
                 completion_text = str(completion)
 
-            # Fresh episode
             reset_result = _env.reset()
             obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
 
-            # Advance to step 3 (where chaos auto-injects)
             dummy_action = '{"tool_name": "wait", "reason": "warm-up"}'
             for _ in range(3):
                 if _env.is_done:
@@ -130,15 +132,32 @@ def reward_fn(completions: list, **kwargs) -> list[float]:
                 rewards.append(0.0)
                 continue
 
-            # Capture chaos state BEFORE the agent acts
+            # FIX 4: capture chaos state BEFORE the agent acts
             chaos_was_active = _env._chaos.is_active
 
-            # Execute the model's completion
-            step_result = _env.step(completion_text)
-            obs_after = step_result[0]
-            # env.step already computes reward with chaos_resolved internally
-            # We take the env's reward directly — it uses the fixed compute_reward
-            reward = float(step_result[1])
+            # FIX 3: parse completion text into a proper action dict before
+            # passing to env.step() — raw text causes a TypeError inside the env
+            try:
+                action = parse_action(completion_text)
+            except Exception:
+                # Unparseable output is a bad action; give a small penalty
+                rewards.append(-0.5)
+                continue
+
+            step_result = _env.step(action)
+            obs_after   = step_result[0]
+            done        = step_result[2] if len(step_result) > 2 else False
+            info        = step_result[3] if len(step_result) > 3 else {}
+
+            # FIX 4: compute_reward receives chaos_resolved so the +3.0 bonus fires
+            chaos_now_resolved = chaos_was_active and not _env._chaos.is_active
+            reward = float(compute_reward(
+                obs=obs_after,
+                action=action,
+                done=done,
+                info=info,
+                chaos_resolved=chaos_now_resolved,
+            ))
             rewards.append(reward)
 
         except Exception as exc:
@@ -170,7 +189,6 @@ def build_prompt_dataset(path: str) -> Dataset:
     with open(path, "r", encoding="utf-8") as f:
         examples = json.load(f)
 
-    # Only chaos examples — higher reward variance = better GRPO signal
     chaos_examples = [
         ex for ex in examples
         if "Active Chaos : None" not in ex["instruction"]
@@ -222,10 +240,8 @@ def save_reward_plot(history: list[float], path: str) -> None:
         ax.set_title("Kaizen OS — GRPO Reward Curve", color="#e2e2e2", pad=12)
         ax.legend(facecolor="#161616", labelcolor="#e2e2e2", framealpha=0.8)
         ax.axhline(y=0, color="#444444", linewidth=0.5, linestyle=":")
-
         plt.tight_layout()
-        plt.savefig(path, dpi=150, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
+        plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close()
         print(f"[GRPO] Reward curve saved to: {path}")
         print(f"[GRPO] >>> Commit {path} to your repo before submission <<<")
@@ -245,6 +261,7 @@ def train():
     print("[GRPO] ===== Kaizen OS — GRPO Reinforcement Learning =====")
     print(f"[GRPO] TRL version    : {_trl.__version__}")
     print(f"[GRPO] SFT model path : {MODEL_PATH}")
+    print(f"[GRPO] Output dir     : {OUTPUT_DIR}")
     print(f"[GRPO] Group size     : {GROUP_SIZE}")
     print(f"[GRPO] Max steps      : {MAX_STEPS}")
     print(f"[GRPO] Max new tokens : {MAX_NEW_TOKENS}")
@@ -254,9 +271,6 @@ def train():
         print("[GRPO] Run training/sft_train.py first.")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # 1. Load model
-    # ------------------------------------------------------------------
     print("\n[GRPO] Loading SFT model...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_PATH,
@@ -269,17 +283,11 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ------------------------------------------------------------------
-    # 2. Dataset
-    # ------------------------------------------------------------------
     print("\n[GRPO] Building prompt dataset...")
     dataset = build_prompt_dataset(DATASET_PATH)
     print(f"[GRPO] Dataset size: {len(dataset)} prompts")
 
-    # ------------------------------------------------------------------
-    # 3. GRPOConfig
-    # FIX: use_vllm wrapped for version safety; save_steps added
-    # ------------------------------------------------------------------
+    # FIX 6: save_steps wrapped in try/except — older GRPOConfig doesn't support it
     grpo_config_kwargs = dict(
         num_generations=GROUP_SIZE,
         max_completion_length=MAX_NEW_TOKENS,
@@ -300,22 +308,24 @@ def train():
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
         gradient_checkpointing=True,
-        save_strategy="steps",   # FIX: checkpoint every 20 steps
-        save_steps=20,           # safe recovery if training crashes
     )
 
-    # use_vllm only exists in TRL >= 0.12 — wrap to avoid TypeError on older
     try:
-        grpo_config = GRPOConfig(use_vllm=False, **grpo_config_kwargs)
-        print("[GRPO] use_vllm=False set (TRL >= 0.12)")
+        grpo_config = GRPOConfig(
+            use_vllm=False,
+            save_strategy="steps",
+            save_steps=20,
+            **grpo_config_kwargs,
+        )
+        print("[GRPO] use_vllm=False + save_steps=20 set (TRL >= 0.13)")
     except TypeError:
-        grpo_config = GRPOConfig(**grpo_config_kwargs)
-        print("[GRPO] use_vllm not supported by this TRL version — skipped")
+        try:
+            grpo_config = GRPOConfig(save_strategy="steps", save_steps=20, **grpo_config_kwargs)
+            print("[GRPO] use_vllm not supported — skipped. save_steps=20 set.")
+        except TypeError:
+            grpo_config = GRPOConfig(**grpo_config_kwargs)
+            print("[GRPO] save_steps not supported by this TRL version — checkpointing skipped.")
 
-    # ------------------------------------------------------------------
-    # 4. GRPOTrainer
-    # FIX: use processing_class= for TRL 0.12+, tokenizer= for older
-    # ------------------------------------------------------------------
     print(f"[GRPO] Using {'processing_class' if _use_processing_class else 'tokenizer'}= (TRL {_trl.__version__})")
     trainer_kwargs = dict(
         model=model,
@@ -331,13 +341,8 @@ def train():
     print("[GRPO] Initialising GRPOTrainer...")
     trainer = GRPOTrainer(**trainer_kwargs)
 
-    # ------------------------------------------------------------------
-    # 5. Train
-    # ------------------------------------------------------------------
     print("\n[GRPO] Starting GRPO training...")
-    print(f"[GRPO] Checkpoints saved every 20 steps to {OUTPUT_DIR}/")
     print(f"[GRPO] Reward range: -10.0 (protected kill) to ~+8.0 (full resolution)")
-    print()
 
     if torch.cuda.is_available():
         start_mem = round(torch.cuda.max_memory_reserved() / 1024**3, 2)
@@ -353,16 +358,10 @@ def train():
     print(f"[GRPO] Runtime  : {trainer_stats.metrics.get('train_runtime', 0):.0f}s")
     print(f"[GRPO] Final loss: {trainer_stats.metrics.get('train_loss', 0):.4f}")
 
-    # ------------------------------------------------------------------
-    # 6. Save final model
-    # ------------------------------------------------------------------
     print(f"\n[GRPO] Saving final policy to {OUTPUT_DIR}...")
     model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
 
-    # ------------------------------------------------------------------
-    # 7. Save reward curve (REQUIRED by judges)
-    # ------------------------------------------------------------------
     if _reward_history:
         print(f"\n[GRPO] Saving reward curve ({len(_reward_history)} points)...")
         save_reward_plot(_reward_history, REWARD_PLOT_PATH)
@@ -372,16 +371,13 @@ def train():
     else:
         print("[GRPO] Warning: no reward history — check reward_fn is being called.")
 
-    # ------------------------------------------------------------------
-    # 8. Optional HF Hub push
-    # ------------------------------------------------------------------
+    # FIX 5: do NOT push to hub from grpo_train.py — run_training.sh handles
+    # all hub pushes with the correct repo names. Pushing here caused the
+    # double-suffix bug (e.g. NehaChikle/kaizen-qwen2.5-3b-sft-grpo-grpo).
     hf_repo = os.environ.get("HF_REPO_ID", "")
     if hf_repo:
-        grpo_repo = hf_repo.rstrip("/") + "-grpo"
-        print(f"\n[GRPO] Pushing to HuggingFace Hub: {grpo_repo}")
-        model.push_to_hub(grpo_repo)
-        tokenizer.push_to_hub(grpo_repo)
-        print("[GRPO] Push complete.")
+        print(f"\n[GRPO] Note: hub push handled by run_training.sh for repo: {hf_repo}")
+        print("[GRPO] Skipping push here to avoid double-suffix bug.")
 
     return OUTPUT_DIR
 

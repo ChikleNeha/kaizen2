@@ -3,24 +3,10 @@
 # run_training.sh
 # Runs INSIDE the HF Job container (pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel)
 # Called by launch_job.py via: bash run_training.sh
-#
-# What this script does:
-#   1. Verify GPU
-#   2. Install all Python dependencies
-#   3. Clone the kaizen2 GitHub repo (contains training/ and environment/)
-#   4. Run SFT  → saves adapter to /output/kaizen_sft_model
-#   5. Run GRPO → saves adapter to /output/kaizen_grpo_model
-#   6. Push both adapters to HF Hub (NehaChikle/kaizen-qwen2.5-3b-sft)
-#
-# Environment variables expected (set by launch_job.py):
-#   HF_TOKEN    — your HuggingFace token (passed as secret)
-#   HF_REPO_ID  — target model repo, e.g. NehaChikle/kaizen-qwen2.5-3b-sft
-#   GITHUB_REPO — repo to clone, e.g. https://github.com/ChikleNeha/kaizen2
 # =============================================================================
 
 set -euo pipefail
 
-# ── Colour helpers ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
 AMBER='\033[0;33m'
 RED='\033[0;31m'
@@ -30,7 +16,6 @@ log()  { echo -e "${GREEN}[KAIZEN]${NC} $*"; }
 warn() { echo -e "${AMBER}[WARN]${NC}  $*"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# ── 0. Sanity checks ─────────────────────────────────────────────────────────
 log "===== Kaizen OS — HF Training Job ====="
 log "Date: $(date -u)"
 
@@ -50,7 +35,6 @@ log "Source GitHub  : $GITHUB_REPO"
 # ── 2. Install dependencies ───────────────────────────────────────────────────
 log "Installing dependencies..."
 
-# Unsloth — GPU build matching CUDA 12.4
 pip install --quiet \
   "unsloth[cu124-torch260] @ git+https://github.com/unslothai/unsloth.git" \
   || {
@@ -59,8 +43,9 @@ pip install --quiet \
       "unsloth @ git+https://github.com/unslothai/unsloth.git"
   }
 
+# FIX: upgraded trl to 0.13.x — 0.12.2 has broken GRPOConfig save_steps support
 pip install --quiet \
-  "trl==0.12.2" \
+  "trl>=0.13.0" \
   "datasets>=2.18.0" \
   "accelerate>=0.28.0" \
   "bitsandbytes>=0.43.0" \
@@ -86,9 +71,8 @@ cd "$WORKDIR"
 log "Repo cloned. Contents:"
 ls -la
 
-# Verify critical files exist
-[[ -f "training/sft_train.py" ]]     || die "training/sft_train.py not found in repo"
-[[ -f "training/grpo_train.py" ]]    || die "training/grpo_train.py not found in repo"
+[[ -f "training/sft_train.py" ]]         || die "training/sft_train.py not found in repo"
+[[ -f "training/grpo_train.py" ]]        || die "training/grpo_train.py not found in repo"
 [[ -f "training/golden_examples.json" ]] || die "training/golden_examples.json not found in repo"
 
 EXAMPLE_COUNT=$(python3 -c "import json; d=json.load(open('training/golden_examples.json')); print(len(d))")
@@ -121,14 +105,15 @@ log "===== PHASE 2: GRPO Reinforcement Learning ====="
 
 GRPO_OUTPUT="/workspace/kaizen_grpo_model"
 
-SFT_MODEL_PATH="$SFT_OUTPUT" \
-HF_REPO_ID="${HF_REPO_ID}-grpo" \
+# FIX: env var name now matches what grpo_train.py reads (KAIZEN_SFT_PATH)
+# FIX: do NOT append -grpo here; grpo_train.py no longer double-appends it
+KAIZEN_SFT_PATH="$SFT_OUTPUT" \
+HF_REPO_ID="$HF_REPO_ID" \
 GRPO_OUTPUT_DIR="$GRPO_OUTPUT" \
 python3 training/grpo_train.py \
   || {
     warn "GRPO training failed — SFT adapter is still saved and usable."
     warn "Check grpo_train.py logs above for the error."
-    # Don't exit — SFT success is still valuable
   }
 
 # ── 7. Push to HF Hub ────────────────────────────────────────────────────────
@@ -140,13 +125,13 @@ from huggingface_hub import HfApi
 
 api = HfApi()
 token = os.environ["HF_TOKEN"]
-sft_repo  = os.environ["HF_REPO_ID"]                  # NehaChikle/kaizen-qwen2.5-3b-sft
-grpo_repo = sft_repo.replace("-sft", "-grpo")          # NehaChikle/kaizen-qwen2.5-3b-grpo
+sft_repo  = os.environ["HF_REPO_ID"]                  # e.g. NehaChikle/kaizen-qwen2.5-3b-sft
+# FIX: build grpo_repo here consistently — grpo_train.py no longer pushes with -grpo suffix
+grpo_repo = sft_repo.replace("-sft", "-grpo")          # e.g. NehaChikle/kaizen-qwen2.5-3b-grpo
 
 sft_dir  = "/workspace/kaizen_sft_model"
 grpo_dir = "/workspace/kaizen_grpo_model"
 
-# Push SFT adapter
 if os.path.isdir(sft_dir) and os.listdir(sft_dir):
     print(f"[PUSH] Uploading SFT adapter to {sft_repo}...")
     api.create_repo(sft_repo, repo_type="model", exist_ok=True, token=token)
@@ -161,7 +146,6 @@ if os.path.isdir(sft_dir) and os.listdir(sft_dir):
 else:
     print("[PUSH] SFT adapter directory is empty or missing — skipping SFT push.")
 
-# Push GRPO adapter
 if os.path.isdir(grpo_dir) and os.listdir(grpo_dir):
     print(f"[PUSH] Uploading GRPO adapter to {grpo_repo}...")
     api.create_repo(grpo_repo, repo_type="model", exist_ok=True, token=token)
@@ -179,7 +163,7 @@ else:
 print("[PUSH] Done.")
 PYEOF
 
-# ── 8. Copy artefacts (loss curves) to output dir ────────────────────────────
+# ── 8. Copy artefacts ─────────────────────────────────────────────────────────
 log "Copying artefacts..."
 mkdir -p /workspace/artefacts
 cp /workspace/kaizen2/loss_curve.png       /workspace/artefacts/ 2>/dev/null || true
