@@ -22,17 +22,29 @@ Set MODEL_PATH to a larger SFT adapter. GRPO config stays identical.
 Memory budget on T4 (16 GB)
 ----------------------------
 Qwen2.5-3B 4-bit:  ~2.5 GB model weights
-GROUP_SIZE=4:       ~4 × 512 tokens × 4B = ~1 GB activation buffer
+GROUP_SIZE=4:       ~4 × 256 tokens × 4B = ~0.5 GB activation buffer
 Ref model copy:     ~2.5 GB (frozen, 4-bit)
 Optimiser (8-bit):  ~0.5 GB
-Total estimate:     ~7 GB — safely within 16 GB
+Total estimate:     ~6 GB — safely within 16 GB
+
+Changes vs v1
+-------------
+- MAX_NEW_TOKENS reduced 512→256 to fix completion clipping (clipped_ratio was 1.0)
+- reward_fn signature fixed: TRL passes completions only, not (prompts, completions)
+- reward_fn handles both string and message-dict completion formats
+- build_prompt_dataset wraps prompts in Alpaca format matching SFT training
+- use_vllm=False added to GRPOConfig to avoid Unsloth conflicts
+- traceback.print_exc() added to reward_fn error handler for debugging
 """
+
+# unsloth MUST be imported before transformers — do not move this line
+import unsloth  # noqa: F401
 
 import json
 import os
 import sys
 import random
-from transformers import GenerationConfig
+import traceback
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -40,7 +52,7 @@ from transformers import GenerationConfig
 
 MODEL_PATH      = os.environ.get("KAIZEN_SFT_PATH", "./kaizen_sft_model")
 GROUP_SIZE      = 4          # G — number of completions per prompt
-MAX_NEW_TOKENS  = 512
+MAX_NEW_TOKENS  = 256        # reduced from 512 — fixes clipped_ratio=1.0
 KL_COEF         = 0.1
 LEARNING_RATE   = 5e-6
 MAX_STEPS       = 80
@@ -99,9 +111,13 @@ _step_counter: int = 0
 _env = KaizenEnv(broadcast=False)
 
 
-def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
+def reward_fn(completions: list, **kwargs) -> list[float]:
     """
     Reward function called by GRPOTrainer for each group of completions.
+
+    TRL passes completions as the only positional argument. The format
+    varies by TRL version — either plain strings or lists of message dicts
+    (chat format). We handle both.
 
     Each completion is evaluated against a fresh environment episode.
     The environment automatically injects chaos at step 3, so completions
@@ -110,8 +126,7 @@ def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[floa
 
     Parameters
     ----------
-    prompts     : list[str] — the input prompts (one per completion in the group)
-    completions : list[str] — the model completions to score
+    completions : list — the model completions to score (strings or message dicts)
 
     Returns
     -------
@@ -120,10 +135,20 @@ def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[floa
     global _step_counter
     rewards: list[float] = []
 
-    for prompt, completion in zip(prompts, completions):
+    for completion in completions:
         try:
-            # Reset env for a fresh episode
-            obs, _ = _env.reset()
+            # Handle both string completions and message-dict completions.
+            # TRL chat format: [{"role": "assistant", "content": "..."}]
+            if isinstance(completion, list):
+                completion_text = completion[-1]["content"] if completion else ""
+            elif isinstance(completion, dict):
+                completion_text = completion.get("content", str(completion))
+            else:
+                completion_text = str(completion)
+
+            # Reset env for a fresh episode — defensive unpacking
+            reset_result = _env.reset()
+            obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
 
             # Advance to step 3 where chaos injects automatically.
             # Use a dummy wait action for warm-up steps.
@@ -131,21 +156,24 @@ def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[floa
             for _ in range(3):
                 if _env.is_done:
                     break
-                obs, _, terminated, truncated, _ = _env.step(dummy_action)
+                step_result = _env.step(dummy_action)
+                obs = step_result[0]
 
             if _env.is_done:
                 rewards.append(0.0)
                 continue
 
-            # Now evaluate the model's completion against the chaos state.
+            # Evaluate the model's completion against the chaos state.
             # env.step() handles parse_action, sandbox, reward, and chaos
-            # resolution internally — we just read back the scalar reward.
-            _, reward, _, _, _ = _env.step(completion)
-            rewards.append(float(reward))
+            # resolution internally — index 1 is always the scalar reward.
+            step_result = _env.step(completion_text)
+            reward = float(step_result[1])
+            rewards.append(reward)
 
         except Exception as exc:
             # Never let a reward computation crash the training loop.
             print(f"[GRPO] reward_fn error: {exc}")
+            traceback.print_exc()
             rewards.append(-1.0)
 
     # Track mean reward for this batch
@@ -175,14 +203,17 @@ def build_prompt_dataset(path: str) -> Dataset:
 
     GRPO only needs the prompts (the 'instruction' field) — it generates
     its own completions via the policy and scores them with reward_fn.
-    We format each prompt in the chat template format so it matches what
-    the model was trained on during SFT.
+
+    Prompts are wrapped in the Alpaca format to match the SFT training
+    template exactly. A mismatch here was causing the model to generate
+    suboptimal completions in v1.
     """
     with open(path, "r", encoding="utf-8") as f:
         examples = json.load(f)
 
-    # Filter to only chaos-active examples (skip the 'wait' healthy examples)
-    # GRPO learns more from high-signal reward variance
+    # Filter to only chaos-active examples (skip the 'wait' healthy examples).
+    # GRPO learns more from high-signal reward variance — chaos examples
+    # give the model meaningful +/- reward signal to learn from.
     chaos_examples = [
         ex for ex in examples
         if "Active Chaos : None" not in ex["instruction"]
@@ -190,13 +221,17 @@ def build_prompt_dataset(path: str) -> Dataset:
 
     print(f"[GRPO] Using {len(chaos_examples)} chaos examples for GRPO prompts")
 
-    # Format as chat messages matching the model's expected input format
-    # We use the raw instruction text; the tokeniser's chat template wraps it
+    # Wrap each prompt in Alpaca format to match SFT training template.
+    # Without this, the model receives prompts in a different format than
+    # it was trained on, degrading generation quality.
     prompts = []
     for ex in chaos_examples:
-        prompts.append({
-            "prompt": ex["instruction"],
-        })
+        formatted = (
+            "Below is an observation of a system under stress. "
+            "Analyse it and respond with your reasoning followed by exactly one JSON action.\n\n"
+            f"### Observation:\n{ex['instruction']}\n\n### Response:"
+        )
+        prompts.append({"prompt": formatted})
 
     # Shuffle for variety across GRPO groups
     random.seed(SEED)
@@ -270,6 +305,7 @@ def train():
     print(f"[GRPO] Learning rate  : {LEARNING_RATE}")
     print(f"[GRPO] Max steps      : {MAX_STEPS}")
     print(f"[GRPO] Output dir     : {OUTPUT_DIR}")
+    print(f"[GRPO] Max new tokens : {MAX_NEW_TOKENS}")
 
     # Check SFT model exists
     if not os.path.isdir(MODEL_PATH):
@@ -303,16 +339,18 @@ def train():
     dataset = build_prompt_dataset(DATASET_PATH)
     print(f"[GRPO] Dataset size: {len(dataset)} prompts")
 
-    
-
     # ------------------------------------------------------------------
     # 3. GRPO configuration
     # ------------------------------------------------------------------
     grpo_config = GRPOConfig(
         # Core GRPO params
-        num_generations=GROUP_SIZE,     # completions per prompt (G)
-        # KL divergence penalty to prevent reward hacking
-        kl_coef=KL_COEF,
+        num_generations=GROUP_SIZE,           # completions per prompt (G)
+        max_completion_length=MAX_NEW_TOKENS, # 256 — prevents clipped_ratio=1.0
+        max_prompt_length=1024,               # cap prompt to save VRAM
+        temperature=0.8,
+        top_p=0.95,
+        # KL penalty — beta is the correct name in current TRL versions
+        beta=KL_COEF,
         # Training params
         learning_rate=LEARNING_RATE,
         per_device_train_batch_size=BATCH_SIZE,
@@ -332,13 +370,8 @@ def train():
         gradient_checkpointing=True,
         # Save
         save_strategy="no",
-    )
-
-    # Generation config — separate from GRPOConfig
-    generation_config = GenerationConfig(
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=0.7,
-        do_sample=True,
+        # Explicitly disable vllm to avoid Unsloth conflicts
+        use_vllm=False,
     )
 
     # ------------------------------------------------------------------
@@ -351,7 +384,6 @@ def train():
         reward_funcs=reward_fn,
         args=grpo_config,
         train_dataset=dataset,
-        generation_config=generation_config,   # <-- pass here
     )
 
     # ------------------------------------------------------------------

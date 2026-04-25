@@ -11,25 +11,13 @@ import StepsBar       from './components/StepsBar';
 /**
  * App — root dashboard layout
  *
- * Layout (spec Section 5.2)
- * ─────────────────────────────────────────────────────────
- * ┌─────────────────────────────────────────────────────┐
- * │  TOPBAR (38px)                                      │
- * ├──────────┬──────────────────────────┬───────────────┤
- * │  Left    │   Center                 │  Right        │
- * │  220px   │   flex:1                 │  160px        │
- * │          │                          │               │
- * │ Vitals   │  ProcessGraph (220px h)  │  Reward       │
- * │ Metrics  ├──────────────────────────┤  Tracker      │
- * │          │  ReasoningPanel          │               │
- * │ Process  │                          │  Action Log   │
- * │ List     │                          │               │
- * ├──────────┴──────────────────────────┴───────────────┤
- * │  StepsBar (36px)                                    │
- * └─────────────────────────────────────────────────────┘
- *
- * Full-viewport, no scrolling on the outer container.
- * Right column splits vertically: RewardTracker top, ActionLog below.
+ * v2 changes
+ * ----------
+ * - Passes lastAction to ProcessGraph so kill dissolve is seeded from the
+ *   action field rather than pid-diffing (fixes ghost node not appearing
+ *   when episode ends and processList resets simultaneously).
+ * - ActionLog no longer has a fixed width — it manages its own width via
+ *   the drag-resize handle, so we remove the fixed 160px wrapper.
  */
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws';
@@ -37,11 +25,14 @@ const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws';
 export default function App() {
   const { state, connected, lastEvent } = useWebSocket(WS_URL);
 
-  // Process list extracted for ProcessGraph — memoised to avoid re-renders
   const processList = useMemo(
     () => state?.obs?.process_list ?? [],
     [state?.obs?.process_list]
   );
+
+  // Pass the last action to ProcessGraph so it can seed ghost nodes
+  // the moment a kill action arrives, before processList updates.
+  const lastAction = state?.action ?? null;
 
   return (
     <div style={{
@@ -63,9 +54,9 @@ export default function App() {
 
       {/* ── Main area ───────────────────────────────────────────── */}
       <div style={{
-        flex:     1,
-        display:  'flex',
-        overflow: 'hidden',
+        flex:      1,
+        display:   'flex',
+        overflow:  'hidden',
         minHeight: 0,
       }}>
 
@@ -82,16 +73,18 @@ export default function App() {
         }}>
           {/* ProcessGraph — fixed height */}
           <div style={{
-            height:       '220px',
-            flexShrink:   0,
-            borderBottom: '0.5px solid #1f1f1f',
+            height:          '220px',
+            flexShrink:      0,
+            borderBottom:    '0.5px solid #1f1f1f',
             backgroundColor: '#111111',
-            overflow:     'hidden',
+            overflow:        'hidden',
           }}>
             <ProcessGraph
               processList={processList}
+              lastAction={state?.action ?? null}   // ← this line must exist
               height={220}
             />
+           
           </div>
 
           {/* ReasoningPanel — fills remaining center height */}
@@ -100,22 +93,22 @@ export default function App() {
 
         {/* ── Right column ──────────────────────────────────────── */}
         <div style={{
-          width:         '160px',
-          flexShrink:    0,
           display:       'flex',
           flexDirection: 'column',
           overflow:      'hidden',
-          borderLeft:    '0.5px solid #1f1f1f',
+          // No fixed width here — ActionLog manages its own width via resize
         }}>
-          {/* RewardTracker — top half */}
+          {/* RewardTracker — top half, fixed width 160px */}
           <div style={{
-            flex:         '0 0 auto',
+            width:        '160px',
+            flexShrink:   0,
             borderBottom: '0.5px solid #1f1f1f',
+            borderLeft:   '0.5px solid #1f1f1f',
           }}>
             <RewardTracker state={state} />
           </div>
 
-          {/* ActionLog — fills remaining right column height */}
+          {/* ActionLog — fills remaining right column height, self-sizing width */}
           <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             <ActionLog state={state} />
           </div>
@@ -140,21 +133,10 @@ export default function App() {
           background-color: #0f0f0f;
         }
 
-        /* Minimal scrollbar styling for panels that allow overflow:auto */
-        ::-webkit-scrollbar {
-          width: 3px;
-          height: 3px;
-        }
-        ::-webkit-scrollbar-track {
-          background: #111111;
-        }
-        ::-webkit-scrollbar-thumb {
-          background: #1f1f1f;
-          border-radius: 2px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-          background: #2a2a2a;
-        }
+        ::-webkit-scrollbar       { width: 3px; height: 3px; }
+        ::-webkit-scrollbar-track { background: #111111; }
+        ::-webkit-scrollbar-thumb { background: #1f1f1f; border-radius: 2px; }
+        ::-webkit-scrollbar-thumb:hover { background: #2a2a2a; }
       `}</style>
     </div>
   );

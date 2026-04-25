@@ -17,6 +17,11 @@ episodes from running simultaneously if /start_episode is called rapidly.
 
 CORS is enabled for all origins so the Vite dev server (localhost:5173)
 and the HuggingFace Space frontend can both connect without proxy config.
+
+Fix (v2)
+--------
+- KaizenEnv is now a module-level singleton so _episode increments correctly
+  across multiple /start_episode calls (was resetting to 1 every call).
 """
 
 import asyncio
@@ -36,40 +41,57 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
-# Lazy model loading
+# Lazy model + env loading
 # ---------------------------------------------------------------------------
-# The LLMAgent is expensive to initialise (model download + GPU load).
-# We load it once on first /start_episode call, not at import time, so the
-# server starts instantly and health checks pass immediately.
 
 _agent = None
 _agent_lock = asyncio.Lock()
 _episode_lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
+# Module-level KaizenEnv singleton
+# ---------------------------------------------------------------------------
+# CRITICAL FIX: The env must be created ONCE at module level, not inside
+# _run_episode_task(). Creating it fresh each call resets _episode to 0,
+# so env.reset() always returns episode=1.
+#
+# We defer actual construction until first use (lazy) so the import doesn't
+# fail if the server is started before the environment package is ready.
+
+_env = None
+
+def _get_env():
+    """Return the module-level KaizenEnv, creating it on first call."""
+    global _env
+    if _env is None:
+        from environment.kaizen_env import KaizenEnv
+        _env = KaizenEnv(broadcast=True, broadcaster=manager)
+        logger.info("[Server] KaizenEnv singleton created.")
+    return _env
+
+# ---------------------------------------------------------------------------
 # Episode state (shared across endpoints)
 # ---------------------------------------------------------------------------
 
 _state: dict[str, Any] = {
-    "status": "idle",           # idle | loading | running | done | error
-    "episode": 0,
-    "current_step": 0,
-    "max_steps": 10,
-    "last_reward": 0.0,
+    "status":            "idle",
+    "episode":           0,
+    "current_step":      0,
+    "max_steps":         10,
+    "last_reward":       0.0,
     "cumulative_reward": 0.0,
-    "chaos_active": None,
-    "started_at": None,
-    "error": None,
+    "chaos_active":      None,
+    "started_at":        None,
+    "error":             None,
 }
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — startup / shutdown hooks
+# Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start background ping task on startup; cancel on shutdown."""
     ping_task = asyncio.create_task(_ping_loop())
     logger.info("[Server] Kaizen OS backend started.")
     yield
@@ -82,7 +104,6 @@ async def lifespan(app: FastAPI):
 
 
 async def _ping_loop() -> None:
-    """Send a keep-alive ping to all WS clients every 30 seconds."""
     while True:
         await asyncio.sleep(30)
         if manager.connection_count > 0:
@@ -115,22 +136,11 @@ app.add_middleware(
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
-    """
-    Accept a dashboard client.  Sends current state immediately on connect
-    so the UI is never blank on first load, then stays open for broadcasts.
-    """
     await manager.connect(ws)
     try:
-        # Send current state immediately so the UI isn't blank
-        await ws.send_text(
-            _build_hello_payload()
-        )
-        # Keep the connection alive — the client drives disconnection
+        await ws.send_text(_build_hello_payload())
         while True:
-            # We don't expect messages from the client, but we must await
-            # something to yield to the event loop and detect disconnects.
             data = await ws.receive_text()
-            # Echo commands back (allows client to send "ping" for latency test)
             if data == "ping":
                 await ws.send_text('{"type":"pong"}')
     except WebSocketDisconnect:
@@ -143,10 +153,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 def _build_hello_payload() -> str:
     import json
     return json.dumps({
-        "type": "hello",
-        "status": _state["status"],
-        "episode": _state["episode"],
-        "message": "Connected to Kaizen OS backend. Waiting for episode start.",
+        "type":       "hello",
+        "status":     _state["status"],
+        "episode":    _state["episode"],
+        "message":    "Connected to Kaizen OS backend. Waiting for episode start.",
         "ws_clients": manager.connection_count,
     })
 
@@ -159,53 +169,50 @@ def _build_hello_payload() -> str:
 async def start_episode() -> dict[str, Any]:
     """
     Trigger a new agent episode.
-
-    If an episode is already running, returns 409.
-    Model loading happens lazily on the first call.
-    The episode runs as a non-blocking background task.
+    Returns 409-equivalent JSON if an episode is already running.
     """
     if _state["status"] == "running":
         return {
-            "status": "error",
+            "status":  "error",
             "message": "An episode is already running. Wait for it to finish.",
         }
 
     if _episode_lock.locked():
         return {
-            "status": "error",
+            "status":  "error",
             "message": "Episode start already in progress.",
         }
 
     asyncio.create_task(_run_episode_task())
 
+    # Return the NEXT episode number for the UI to show immediately
+    next_ep = _state["episode"] + 1
     return {
-        "status": "accepted",
+        "status":  "accepted",
         "message": "Episode starting. Watch the WebSocket for live updates.",
-        "episode": _state["episode"] + 1,
+        "episode": next_ep,
     }
 
 
 async def _run_episode_task() -> None:
     """
-    Background task that loads the agent (if needed) and runs one episode.
-    Updates _state throughout so /status always reflects reality.
+    Background task: loads agent if needed, then runs one full episode.
+    Uses the module-level env singleton so episode numbers increment correctly.
     """
     global _agent
 
     async with _episode_lock:
-        _state["status"] = "loading"
-        _state["error"] = None
+        _state["status"]     = "loading"
+        _state["error"]      = None
         _state["started_at"] = time.time()
 
-        # Broadcast loading state
         await manager.broadcast({
-            "type": "status",
-            "status": "loading",
+            "type":    "status",
+            "status":  "loading",
             "message": "Loading LLM agent...",
         })
 
         # Lazy-load the agent in a thread so we don't block the event loop
-        # during the multi-second model load.
         try:
             async with _agent_lock:
                 if _agent is None:
@@ -215,60 +222,56 @@ async def _run_episode_task() -> None:
         except Exception as exc:
             logger.error(f"[Server] Agent load failed: {exc}")
             _state["status"] = "error"
-            _state["error"] = str(exc)
+            _state["error"]  = str(exc)
             await manager.broadcast({
-                "type": "error",
+                "type":    "error",
                 "message": f"Failed to load agent: {exc}",
             })
             return
 
-        # Import here to avoid circular import at module level
-        from environment.kaizen_env import KaizenEnv
+        # ---- Use the singleton env — DO NOT construct a new one here ----
+        env = _get_env()
+        obs, info = env.reset()          # increments env._episode by 1
 
-        env = KaizenEnv(broadcast=True, broadcaster=manager)
-        obs, info = env.reset()
-
-        _state["status"] = "running"
-        _state["episode"] = env.episode
+        _state["status"]       = "running"
+        _state["episode"]      = env.episode   # now 2, 3, 4… on repeat calls
         _state["current_step"] = 0
 
         logger.info(f"[Server] Episode {env.episode} started.")
 
         await manager.broadcast({
-            "type": "status",
-            "status": "running",
+            "type":    "status",
+            "status":  "running",
             "episode": env.episode,
             "message": f"Episode {env.episode} started.",
         })
 
-        # Run the episode step by step — offload LLM inference to a thread
+        # Episode loop
         while not env.is_done:
             try:
                 current_obs = env.current_obs
 
-                # Run LLM inference without blocking the event loop
+                # Run LLM inference in thread — never blocks the event loop
                 raw_output, action, error = await asyncio.get_event_loop().run_in_executor(
                     None, _agent.act, current_obs
                 )
 
-                # Step the environment (sync call, fast — no GPU work)
                 obs, reward, terminated, truncated, step_info = env.step(raw_output)
 
-                _state["current_step"] = obs.get("step", 0)
-                _state["last_reward"] = reward
+                _state["current_step"]      = obs.get("step", 0)
+                _state["last_reward"]       = reward
                 _state["cumulative_reward"] = step_info.get("cumulative_reward", 0.0)
-                _state["chaos_active"] = obs.get("active_chaos")
+                _state["chaos_active"]      = obs.get("active_chaos")
 
-                # The env already broadcasts via _schedule_broadcast(),
-                # but we yield here so the event loop can flush messages.
+                # Yield to event loop so WS messages flush
                 await asyncio.sleep(0)
 
             except Exception as exc:
                 logger.error(f"[Server] Step error: {exc}", exc_info=True)
                 _state["status"] = "error"
-                _state["error"] = str(exc)
+                _state["error"]  = str(exc)
                 await manager.broadcast({
-                    "type": "error",
+                    "type":    "error",
                     "message": f"Step error: {exc}",
                 })
                 return
@@ -281,31 +284,27 @@ async def _run_episode_task() -> None:
         )
 
         await manager.broadcast({
-            "type": "episode_done",
-            "episode": env.episode,
+            "type":             "episode_done",
+            "episode":          env.episode,
             "cumulative_reward": _state["cumulative_reward"],
-            "steps": _state["current_step"],
-            "message": "Episode complete. Click Start Episode to run another.",
+            "steps":            _state["current_step"],
+            "message":          "Episode complete. Click Start Episode to run another.",
         })
 
 
 def _load_agent():
     """
     Synchronous agent loader — runs in a thread executor.
-    Reads MODEL_NAME from env so it can be overridden at HF eval time.
-
-    Set KAIZEN_DEMO_MODE=true to skip LLM loading entirely and use a
-    rule-based dummy agent for fast dashboard testing without a GPU.
+    Set KAIZEN_DEMO_MODE=true to use the rule-based DemoAgent.
     """
-    # Demo mode — instant start, no model download needed
     if os.environ.get("KAIZEN_DEMO_MODE", "false").lower() == "true":
         from agent.demo_agent import DemoAgent
         return DemoAgent()
 
     from agent.llm_agent import LLMAgent
-    model_name = os.environ.get("KAIZEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
-    load_in_4bit = os.environ.get("KAIZEN_4BIT", "true").lower() == "true"
-    return LLMAgent(model_name=model_name, load_in_4bit=load_in_4bit)
+    model_name  = os.environ.get("KAIZEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
+    use_unsloth = os.environ.get("KAIZEN_USE_UNSLOTH", "true").lower() == "true"
+    return LLMAgent(model_name=model_name, use_unsloth=use_unsloth)
 
 
 # ---------------------------------------------------------------------------
@@ -314,28 +313,23 @@ def _load_agent():
 
 @app.get("/status")
 async def get_status() -> dict[str, Any]:
-    """
-    Return current agent and server status.
-
-    Used by the HF Space UI and the TopBar component to show live state.
-    """
     uptime = None
     if _state["started_at"] is not None:
         uptime = round(time.time() - _state["started_at"], 1)
 
     return {
-        "status": _state["status"],
-        "episode": _state["episode"],
-        "current_step": _state["current_step"],
-        "max_steps": _state["max_steps"],
-        "last_reward": _state["last_reward"],
+        "status":            _state["status"],
+        "episode":           _state["episode"],
+        "current_step":      _state["current_step"],
+        "max_steps":         _state["max_steps"],
+        "last_reward":       _state["last_reward"],
         "cumulative_reward": _state["cumulative_reward"],
-        "chaos_active": _state["chaos_active"],
-        "error": _state["error"],
-        "uptime_seconds": uptime,
-        "ws_connections": manager.connection_count,
-        "total_broadcasts": manager.total_broadcasts,
-        "model": os.environ.get("KAIZEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct"),
+        "chaos_active":      _state["chaos_active"],
+        "error":             _state["error"],
+        "uptime_seconds":    uptime,
+        "ws_connections":    manager.connection_count,
+        "total_broadcasts":  manager.total_broadcasts,
+        "model":             os.environ.get("KAIZEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct"),
     }
 
 
@@ -345,7 +339,6 @@ async def get_status() -> dict[str, Any]:
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:
-    """Liveness probe for HF Spaces, Docker, and load balancers."""
     return {"status": "ok", "service": "kaizen-os-backend"}
 
 

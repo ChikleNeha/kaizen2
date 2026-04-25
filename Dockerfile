@@ -1,70 +1,53 @@
-# =============================================================================
-# Kaizen OS — HuggingFace Space Dockerfile
-# =============================================================================
-# This is the TOP-LEVEL Dockerfile used by HF Spaces (Docker SDK).
-# It is different from docker/Dockerfile.sandbox (which is for action isolation).
-#
-# Build order:
-#   1. Install Node + npm (for frontend build)
-#   2. Install Python dependencies
-#   3. Copy project files
-#   4. Build the React frontend
-#   5. Start the FastAPI backend via app.py
-# =============================================================================
+# HuggingFace Space Dockerfile
+# Builds frontend, serves FastAPI backend on port 7860
+# Uses DemoAgent by default (no GPU needed on Space)
+# For live LLM demo: run server locally on A100 Colab + ngrok
 
+FROM node:20-slim AS frontend-builder
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+# Point WebSocket at the Space's own backend
+RUN echo 'VITE_WS_URL=wss://YOUR_USERNAME-kaizen-os.hf.space/ws' > .env
+RUN npm run build
+
+# ── Python backend ──────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# ---------------------------------------------------------------------------
-# System dependencies — Node.js for frontend build
-# ---------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# ---------------------------------------------------------------------------
-# Working directory
-# ---------------------------------------------------------------------------
 WORKDIR /app
 
-# ---------------------------------------------------------------------------
-# Python dependencies
-# ---------------------------------------------------------------------------
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps (CPU-only — Space runs demo mode, no model load)
 COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    fastapi>=0.110.0 \
+    uvicorn>=0.29.0 \
+    websockets>=12.0 \
+    psutil>=5.9.0 \
+    pydantic>=2.0.0 \
+    gymnasium>=0.29.0
 
-# Install torch CPU-only first to save space on CPU Space instances
-# At hackathon eval with GPU Space, remove the --index-url override
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements.txt
-
-# ---------------------------------------------------------------------------
 # Copy project
-# ---------------------------------------------------------------------------
 COPY . .
 
-# ---------------------------------------------------------------------------
-# Build frontend
-# ---------------------------------------------------------------------------
-RUN cd frontend \
-    && npm install \
-    && npm run build \
-    && echo "Frontend build complete"
+# Copy built frontend
+COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
-# ---------------------------------------------------------------------------
-# Expose port
-# ---------------------------------------------------------------------------
+# Serve frontend via FastAPI static files
+RUN pip install --no-cache-dir aiofiles
+
+# Environment
+ENV KAIZEN_DEMO_MODE=true
+ENV PORT=7860
 EXPOSE 7860
 
-# ---------------------------------------------------------------------------
-# Environment defaults
-# ---------------------------------------------------------------------------
-ENV PORT=7860
-ENV KAIZEN_MODEL_NAME="Qwen/Qwen2.5-3B-Instruct"
-ENV KAIZEN_4BIT="true"
-
-# ---------------------------------------------------------------------------
-# Start
-# ---------------------------------------------------------------------------
-CMD ["python", "app.py"]
+# Mount static frontend
+CMD ["python", "-m", "uvicorn", "server.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "7860", \
+     "--log-level", "info"]
