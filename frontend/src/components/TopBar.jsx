@@ -16,8 +16,9 @@ import { useState, useCallback } from 'react';
  */
 
 const WS_BASE = import.meta.env.VITE_API_URL
-  ?? (window.location.hostname === 'localhost' ? 'http://localhost:8000' : '');
-
+  ?? (window.location.hostname === 'localhost'
+      ? 'http://localhost:8000'
+      : 'https://nehachikle-kaizen-os.hf.space');
 // ---------------------------------------------------------------------------
 // Status dot colours
 // ---------------------------------------------------------------------------

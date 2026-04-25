@@ -20,12 +20,9 @@ import StepsBar       from './components/StepsBar';
  *   the drag-resize handle, so we remove the fixed 160px wrapper.
  */
 
-// REPLACE the 3 const lines with:
 const isLocal = window.location.hostname === 'localhost';
-const API_URL = isLocal ? 'http://localhost:8000' : '';
-const WS_URL  = isLocal
-  ? 'ws://localhost:8000/ws'
-  : `wss://nehachikle-kaizen-os.hf.space/ws`;
+const API_URL = isLocal ? 'http://localhost:8000' : 'https://nehachikle-kaizen-os.hf.space';
+const WS_URL  = isLocal ? 'ws://localhost:8000/ws' : 'wss://nehachikle-kaizen-os.hf.space/ws';
 
 export default function App() {
   const { state, connected, lastEvent } = useWebSocket(WS_URL);
