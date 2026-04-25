@@ -424,9 +424,8 @@ def train():
     # ------------------------------------------------------------------
     grpo_config = GRPOConfig(
         num_generations=GROUP_SIZE,
-        max_new_tokens=MAX_NEW_TOKENS,
         temperature=0.7,
-        kl_coef=KL_COEF,
+        beta=KL_COEF,
         learning_rate=LEARNING_RATE,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
@@ -448,6 +447,10 @@ def train():
     # ------------------------------------------------------------------
     # 4. GRPOTrainer
     # ------------------------------------------------------------------
+
+
+    from transformers import GenerationConfig
+
     print("[GRPO] Initialising GRPOTrainer...")
     trainer = GRPOTrainer(
         model=model,
@@ -455,6 +458,7 @@ def train():
         reward_funcs=reward_fn,
         args=grpo_config,
         train_dataset=dataset,
+        generation_config=GenerationConfig(max_new_tokens=256),
     )
 
     # ------------------------------------------------------------------
