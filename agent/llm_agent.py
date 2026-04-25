@@ -29,7 +29,6 @@ import re
 import time
 from typing import Any
 
-import torch
 
 from agent.prompts import SYSTEM_PROMPT, format_observation
 from environment.action_space import AgenticOSAction, parse_action
@@ -67,6 +66,9 @@ class LLMAgent:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self._consecutive_failures: int = 0
+
+        import torch
+        self._torch = torch
 
         print(f"[LLMAgent] Loading model: {self.model_name}")
         print(f"[LLMAgent] max_new_tokens={max_new_tokens} | temperature={temperature}")
