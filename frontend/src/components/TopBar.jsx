@@ -15,11 +15,8 @@ import { useState, useCallback } from 'react';
  * - Start button: calls POST /start_episode on the backend
  */
 
-// REPLACE WITH THIS:
 const WS_BASE = import.meta.env.VITE_API_URL
-  ?? (window.location.hostname === 'localhost'
-      ? 'http://localhost:8000'
-      : `https://${window.location.hostname}`);
+  ?? (window.location.hostname === 'localhost' ? 'http://localhost:8000' : '');
 
 // ---------------------------------------------------------------------------
 // Status dot colours
