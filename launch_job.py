@@ -1,19 +1,26 @@
-from huggingface_hub import HfApi
+import os
+from huggingface_hub import run_job
 
-api = HfApi()
+# Token comes from environment — never hardcode it
+hf_token = os.environ.get("HF_TOKEN")
+if not hf_token:
+    raise ValueError("HF_TOKEN environment variable not set. Run: set HF_TOKEN=your_token")
 
 print("Launching SFT + GRPO training job on HF...")
 
-job = api.create_job(
-    repo_id="NehaChikle/kaizen-qwen2.5-3b-sft",
-    job_type="training",
-    hardware="a10g-small",
-    environment={
+job = run_job(
+    image="pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel",
+    command=["bash", "run_training.sh"],
+    flavor="a10g-small",
+    timeout=7200,  # 2 hours — covers SFT + GRPO with buffer
+    env={
         "HF_REPO_ID": "NehaChikle/kaizen-qwen2.5-3b-sft"
     },
-    command="bash run_training.sh",
+    secrets={
+        "HF_TOKEN": hf_token
+    },
 )
 
-print(f"✅ Job created successfully!")
-print(f"Job details: {job}")
-print(f"Monitor at: https://huggingface.co/NehaChikle/kaizen-qwen2.5-3b-sft")
+print(f"✅ Job launched!")
+print(f"Monitor at: {job.url}")
+print(f"Job ID: {job.id}")
