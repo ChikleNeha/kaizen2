@@ -26,11 +26,11 @@ This project is an LLM agent that autonomously manages a simulated OS.
 
 | Resource | URL |
 |---|---|
-| 🤗 HuggingFace Space | `https://huggingface.co/spaces/YOUR_USERNAME/kaizen-os` |
+| 🤗 HuggingFace Space | `https://huggingface.co/spaces/NehaChikle/kaizen-os` |
 | 📓 Colab Training Notebook | `https://colab.research.google.com/drive/YOUR_NOTEBOOK_ID` |
-| 🤖 Trained GRPO Model | `https://huggingface.co/YOUR_USERNAME/kaizen-os-grpo` |
+| 🤖 Trained GRPO Model | `https://huggingface.co/NehaChikle/kaizen-os-grpo` |
 | 📹 Demo Video | `https://youtube.com/YOUR_VIDEO_ID` |
-| 💻 Code Repository | `https://github.com/YOUR_USERNAME/kaizen-os` |
+| 💻 Code Repository | `https://github.com/ChikleNeha/kaizen-os` |
 
 > ⚠️ Replace all `YOUR_USERNAME` / `YOUR_*` placeholders before submitting.
 
