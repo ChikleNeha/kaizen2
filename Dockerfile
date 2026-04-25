@@ -9,7 +9,7 @@ COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
 COPY frontend/ ./
 # Point WebSocket at the Space's own backend
-RUN echo 'VITE_WS_URL=wss://NehaChikle-kaizen-os.hf.space/ws' > .env
+RUN echo 'VITE_WS_URL=wss://nehachikle-kaizen-os.hf.space/ws' > .env
 RUN npm run build
 
 # ── Python backend ──────────────────────────────────────────────────────────
