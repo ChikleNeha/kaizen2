@@ -1,13 +1,17 @@
 ---
-title: Kaizen OS — Agentic Kernel
+title: Kaizen OS
 emoji: 🖥️
 colorFrom: green
 colorTo: gray
 sdk: docker
 app_port: 7860
 pinned: true
-short_description: LLM agent that autonomously manages a simulated OS in real-time
 ---
+
+# Kaizen OS — Agentic Kernel
+This project is an LLM agent that autonomously manages a simulated OS.
+
+
 
 
 # 🧠 Project Kaizen: The Agentic Kernel
