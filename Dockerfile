@@ -9,7 +9,7 @@ COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
 COPY frontend/ ./
 # Point WebSocket at the Space's own backend
-RUN echo 'VITE_WS_URL=wss://YOUR_USERNAME-kaizen-os.hf.space/ws' > .env
+RUN echo 'VITE_WS_URL=wss://NehaChikle-kaizen-os.hf.space/ws' > .env
 RUN npm run build
 
 # ── Python backend ──────────────────────────────────────────────────────────
@@ -45,6 +45,9 @@ RUN pip install --no-cache-dir aiofiles
 ENV KAIZEN_DEMO_MODE=true
 ENV PORT=7860
 EXPOSE 7860
+
+RUN useradd -m -u 1000 user
+USER user
 
 # Mount static frontend
 CMD ["python", "-m", "uvicorn", "server.main:app", \
