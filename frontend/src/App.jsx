@@ -20,7 +20,10 @@ import StepsBar       from './components/StepsBar';
  *   the drag-resize handle, so we remove the fixed 160px wrapper.
  */
 
-const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws';
+const isLocal = window.location.hostname === 'localhost';
+const API_URL = isLocal ? 'http://localhost:8000' : `https://${window.location.hostname}`;
+const WS_URL = isLocal ? 'ws://localhost:8000/ws' : `wss://${window.location.hostname}/ws`;
+
 
 export default function App() {
   const { state, connected, lastEvent } = useWebSocket(WS_URL);
