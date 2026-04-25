@@ -1,88 +1,93 @@
-name: kaizen-os
-version: 1.0.0
+name: KaizenOS
+version: "1.0"
 description: >
-  An agentic OS management environment where an LLM monitors real system
-  telemetry, detects chaos events (memory leaks, CPU hogs, thermal spikes,
-  zombie storms, fork bombs, semantic process conflicts), and takes corrective
-  actions via structured tool calls. Trained with SFT + GRPO on Qwen2.5-3B.
-author: YOUR_NAME
-theme: "3.1"
-theme_name: "World Modeling — Professional Tasks"
+  A reinforcement learning environment where an LLM agent autonomously manages
+  a simulated operating system. The agent monitors real system telemetry via
+  psutil, detects chaos events (memory leaks, CPU hogs, thermal spikes,
+  zombie storms, fork bombs, semantic decoys), reasons through them using
+  chain-of-thought, and takes corrective actions via structured tool calls.
+  Trained using SFT (Unsloth LoRA) followed by GRPO (TRL GRPOTrainer).
+
+theme:
+  primary: "3.1"
+  primary_name: "World Modeling (Professional Tasks)"
+  secondary: "2"
+  secondary_name: "Long-Horizon Planning"
 
 environment:
-  entry_point: environment.kaizen_env:KaizenEnv
+  class: KaizenEnv
+  module: environment.kaizen_env
   base_class: gymnasium.Env
-  observation_space: text
-  action_space: text
-  reward_range: [-15.0, 10.0]
+  entry_point: "environment.kaizen_env:KaizenEnv"
+
+  observation_space:
+    type: Text
+    description: >
+      Real-time OS telemetry snapshot including CPU%, RAM%, thermal°C,
+      uptime, top-8 process list with PIDs and CPU usage, active chaos
+      event name (hidden from agent for partial observability), step counter,
+      and system log snippet.
+
+  action_space:
+    type: Text
+    description: >
+      One of 7 structured JSON tool calls: kill_process, allocate_memory,
+      thermal_mitigation, prioritize_task, inspect_logs, list_processes, wait.
+      All validated via Pydantic v2 before execution.
+
+  reset:
+    description: >
+      Collects fresh psutil observation, records protected PIDs, resets
+      ChaosInjector state. Returns (obs_dict, info_dict).
+
+  step:
+    description: >
+      Accepts raw LLM output string. Parses action with Pydantic v2.
+      Injects chaos at step 3. Executes action in simulated sandbox.
+      Computes reward. Broadcasts state via WebSocket.
+      Returns (obs, reward, terminated, truncated, info).
+
   max_steps: 10
   chaos_inject_step: 3
 
-chaos_scenarios:
-  - name: memory_leak
-    resolution: kill chaos process (pid 2847)
-    difficulty: easy
-  - name: cpu_hog
-    resolution: kill chaos process (pid 3991)
-    difficulty: easy
-  - name: thermal_spike
-    resolution: kill or thermal_mitigation
-    difficulty: medium
-  - name: zombie_storm
-    resolution: kill parent process (pid 5512)
-    difficulty: medium
-  - name: fork_bomb
-    resolution: kill parent (pid 6631) NOT busiest child (pid 6700)
-    difficulty: hard
-  - name: semantic_decoy
-    resolution: kill ad_renderer (pid 7741) NOT hospital_monitor (pid 7700)
-    difficulty: hard
-    note: >
-      Two processes at identical CPU%. Only the log distinguishes them.
-      No rule-based system can solve this scenario.
+  chaos_scenarios:
+    - memory_leak
+    - cpu_hog
+    - thermal_spike
+    - zombie_storm
+    - fork_bomb
+    - semantic_decoy
 
-actions:
-  - kill_process
-  - thermal_mitigation
-  - allocate_memory
-  - prioritize_task
-  - inspect_logs
-  - list_processes
-  - wait
+  reward_range: [-15.0, 12.0]
+  termination: "Chaos resolved OR max_steps reached"
+  truncation: "max_steps reached without chaos resolution"
 
-reward_components:
-  parse_failure: -1.0
-  protected_process_kill: -10.0
-  wrong_semantic_kill: -15.0
-  thermal_improvement: "delta_thermal * 0.15"
-  cpu_improvement: "delta_cpu * 0.10"
-  critical_process_alive: "+0.5 per critical process"
-  chaos_resolved: +3.0
-  system_nominal: +1.0
-  unnecessary_kill: -2.0
+model:
+  name: Qwen2.5-3B-Instruct
+  provider: unsloth/Qwen2.5-3B-Instruct
+  quantization: 4-bit NF4
+  adapter: LoRA (r=16, alpha=16)
 
 training:
-  framework: unsloth + trl
-  algorithm: SFT then GRPO
-  base_model: Qwen/Qwen2.5-3B-Instruct
-  lora_rank: 16
-  quantisation: 4-bit NF4
-  sft_steps: 100
-  grpo_steps: 80
-  group_size: 4
-  hardware: Google Colab A100
-  colab_notebook: "https://colab.research.google.com/drive/YOUR_NOTEBOOK_ID"
+  stage_1:
+    method: SFT
+    framework: Unsloth + TRL SFTTrainer
+    dataset: training/golden_examples.json
+    examples: 60
+    steps: 100
+    output: kaizen_sft_model/
+  stage_2:
+    method: GRPO
+    framework: TRL GRPOTrainer
+    group_size: 4
+    kl_coef: 0.1
+    steps: 80
+    output: kaizen_grpo_model/
+    reward_function: environment.reward.compute_reward
 
-huggingface:
-  space_url: "https://huggingface.co/spaces/YOUR_USERNAME/kaizen-os"
-  model_url: "https://huggingface.co/YOUR_USERNAME/kaizen-os-grpo"
+hardware:
+  target: Google Colab T4 (16GB VRAM)
+  estimated_vram_sft: "6.2 GB"
+  estimated_vram_grpo: "9.0 GB"
 
-partial_observability:
-  hidden_fields:
-    - active_chaos
-  agent_must_infer_from:
-    - cpu_percent
-    - thermal_celsius
-    - ram_percent
-    - log_snippet
-    - process_list
+repository: https://github.com/ChikleNeha/kaizen2

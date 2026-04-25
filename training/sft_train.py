@@ -2,17 +2,15 @@
 training/sft_train.py
 Supervised Fine-Tuning (SFT) for the Kaizen OS agent using Unsloth + LoRA.
 
-Run on Google Colab T4 (free tier, 16 GB VRAM):
-    !pip install unsloth trl datasets accelerate bitsandbytes
+FIXES vs original:
+  1. Saves loss_curve.png to disk (required by judges — committed to repo)
+  2. Uses processing_class= instead of tokenizer= for TRL 0.12+ compatibility
+  3. Pins safe TRL usage pattern
+
+Run on Google Colab T4:
+    !pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+    !pip install trl==0.12.2 datasets accelerate bitsandbytes matplotlib
     !python training/sft_train.py
-
-After training the LoRA adapter is saved to OUTPUT_DIR.
-The adapter can then be loaded by LLMAgent(model_name=OUTPUT_DIR).
-
-HF Credits upgrade path
------------------------
-Change MODEL_NAME to a larger model — everything else stays identical.
-Example: "unsloth/Qwen2.5-14B-Instruct" or "unsloth/Llama-3.1-8B-Instruct"
 """
 
 import json
@@ -20,7 +18,7 @@ import os
 import sys
 
 # ---------------------------------------------------------------------------
-# Configuration — do not change these values without re-reading the spec
+# Configuration
 # ---------------------------------------------------------------------------
 
 MODEL_NAME       = "unsloth/Qwen2.5-3B-Instruct"
@@ -38,12 +36,10 @@ GRAD_ACCUM       = 4
 LEARNING_RATE    = 2e-4
 MAX_STEPS        = 100
 OUTPUT_DIR       = "./kaizen_sft_model"
+LOSS_PLOT_PATH   = "./loss_curve.png"   # judges require this committed to repo
 
-DATASET_PATH     = os.path.join(
-    os.path.dirname(__file__), "golden_examples.json"
-)
+DATASET_PATH = os.path.join(os.path.dirname(__file__), "golden_examples.json")
 
-# Alpaca prompt template (must match agent/prompts.py format_alpaca)
 ALPACA_TEMPLATE = (
     "Below is an instruction that describes a task. "
     "Write a response that appropriately completes the request.\n\n"
@@ -52,10 +48,9 @@ ALPACA_TEMPLATE = (
     "### Response:\n{output}"
 )
 
-EOS_TOKEN_PLACEHOLDER = "{eos_token}"
 
 # ---------------------------------------------------------------------------
-# Imports (deferred so the config block is visible before heavy imports)
+# Import guard
 # ---------------------------------------------------------------------------
 
 def _check_imports():
@@ -67,7 +62,9 @@ def _check_imports():
             missing.append(pkg)
     if missing:
         print(f"[SFT] Missing packages: {missing}")
-        print("[SFT] Install with: pip install unsloth trl datasets accelerate bitsandbytes")
+        print("[SFT] Install with:")
+        print('  pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"')
+        print("  pip install trl==0.12.2 datasets accelerate bitsandbytes matplotlib")
         sys.exit(1)
 
 _check_imports()
@@ -84,18 +81,9 @@ import torch
 # ---------------------------------------------------------------------------
 
 def load_dataset_from_json(path: str) -> Dataset:
-    """
-    Load the golden_examples.json file and return a HuggingFace Dataset.
-
-    Each example is formatted using the Alpaca prompt template with the
-    EOS token appended so the model learns where to stop generating.
-    """
     with open(path, "r", encoding="utf-8") as f:
         examples = json.load(f)
-
     print(f"[SFT] Loaded {len(examples)} training examples from {path}")
-
-    # We store the formatted text in a 'text' column — SFTTrainer expects this
     texts = []
     for ex in examples:
         formatted = ALPACA_TEMPLATE.format(
@@ -103,18 +91,57 @@ def load_dataset_from_json(path: str) -> Dataset:
             input=ex.get("input", ""),
             output=ex["output"],
         )
-        # EOS token will be appended after tokeniser is loaded (see train())
-        texts.append({"text": formatted, "raw_output": ex["output"]})
-
+        texts.append({"text": formatted})
     return Dataset.from_list(texts)
 
 
 def formatting_func(examples: dict, eos_token: str) -> list[str]:
-    """
-    Called by SFTTrainer to format each batch.
-    Appends the EOS token so the model learns sequence termination.
-    """
     return [text + eos_token for text in examples["text"]]
+
+
+def save_loss_plot(log_history: list[dict], path: str) -> None:
+    """
+    Save training loss curve to disk.
+    Required by judges: loss_curve.png must be committed to the repo.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        steps = [entry["step"] for entry in log_history if "loss" in entry]
+        losses = [entry["loss"] for entry in log_history if "loss" in entry]
+
+        if not steps:
+            print("[SFT] No loss data to plot.")
+            return
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(steps, losses, color="#4ade80", linewidth=1.5, label="Training loss")
+
+        ax.set_facecolor("#0f0f0f")
+        fig.patch.set_facecolor("#0f0f0f")
+        ax.tick_params(colors="#888888")
+        ax.spines[:].set_color("#1f1f1f")
+        ax.set_xlabel("Step", color="#888888")
+        ax.set_ylabel("Loss", color="#888888")
+        ax.set_title("Kaizen OS — SFT Loss Curve", color="#e2e2e2", pad=12)
+        ax.legend(facecolor="#161616", labelcolor="#e2e2e2", framealpha=0.8)
+
+        plt.tight_layout()
+        plt.savefig(path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        plt.close()
+        print(f"[SFT] Loss curve saved to: {path}")
+        print(f"[SFT] >>> Commit {path} to your repo before submission <<<")
+
+    except ImportError:
+        # Save raw data as JSON fallback
+        json_path = path.replace(".png", "_loss.json")
+        data = {entry["step"]: entry["loss"] for entry in log_history if "loss" in entry}
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[SFT] matplotlib not available. Loss data saved to: {json_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +157,13 @@ def train():
     print(f"[SFT] Output dir   : {OUTPUT_DIR}")
 
     # ------------------------------------------------------------------
-    # 1. Load base model with Unsloth + LoRA
+    # 1. Load base model
     # ------------------------------------------------------------------
     print("\n[SFT] Loading base model...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
-        dtype=None,              # auto-detect: float16 on GPU, float32 on CPU
+        dtype=None,
         load_in_4bit=LOAD_IN_4BIT,
     )
 
@@ -148,13 +175,12 @@ def train():
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        use_gradient_checkpointing="unsloth",  # saves VRAM on T4
+        use_gradient_checkpointing="unsloth",
         random_state=42,
         use_rslora=False,
         loftq_config=None,
     )
 
-    # Print trainable parameter count
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
@@ -164,13 +190,12 @@ def train():
     )
 
     # ------------------------------------------------------------------
-    # 2. Load and format dataset
+    # 2. Dataset
     # ------------------------------------------------------------------
     print("\n[SFT] Preparing dataset...")
     dataset = load_dataset_from_json(DATASET_PATH)
     eos_token = tokenizer.eos_token
 
-    # Wrap formatting_func to capture eos_token via closure
     def _fmt(examples):
         return formatting_func(examples, eos_token)
 
@@ -191,58 +216,72 @@ def train():
         lr_scheduler_type="linear",
         seed=42,
         output_dir=OUTPUT_DIR,
-        report_to="none",        # set to "wandb" if wandb is configured
-        save_strategy="no",      # save manually at end to avoid checkpoint bloat
+        report_to="none",
+        save_strategy="no",
     )
 
     # ------------------------------------------------------------------
     # 4. SFTTrainer
+    # FIX: use processing_class= instead of tokenizer= for TRL 0.12+
     # ------------------------------------------------------------------
     print("[SFT] Initialising SFTTrainer...")
-    trainer = SFTTrainer(
+
+    # Detect TRL version to use correct parameter name
+    import trl as _trl
+    _trl_version = tuple(int(x) for x in _trl.__version__.split(".")[:2])
+    _use_processing_class = _trl_version >= (0, 12)
+    print(f"[SFT] TRL version: {_trl.__version__} — using {'processing_class' if _use_processing_class else 'tokenizer'}=")
+
+    trainer_kwargs = dict(
         model=model,
-        tokenizer=tokenizer,
         train_dataset=dataset,
         formatting_func=_fmt,
         max_seq_length=MAX_SEQ_LENGTH,
         dataset_num_proc=1,
-        packing=False,            # packing=True can cause sequence mixing issues
+        packing=False,
         args=training_args,
     )
+    if _use_processing_class:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = SFTTrainer(**trainer_kwargs)
 
     # ------------------------------------------------------------------
     # 5. Train
     # ------------------------------------------------------------------
     print("\n[SFT] Starting training...")
-    print(f"[SFT] Steps: {MAX_STEPS} | Effective batch: {BATCH_SIZE * GRAD_ACCUM}")
-
-    gpu_stats = None
     if torch.cuda.is_available():
         gpu_stats = torch.cuda.get_device_properties(0)
-        start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
         print(f"[SFT] GPU: {gpu_stats.name} | VRAM: {gpu_stats.total_memory / 1e9:.1f} GB")
-        print(f"[SFT] Reserved at start: {start_gpu_memory} GB")
 
     trainer_stats = trainer.train()
 
-    if torch.cuda.is_available() and gpu_stats is not None:
-        used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-        print(f"[SFT] Peak VRAM usage: {used_memory} GB")
+    if torch.cuda.is_available():
+        peak_mem = round(torch.cuda.max_memory_reserved() / 1024**3, 2)
+        print(f"[SFT] Peak VRAM: {peak_mem} GB")
 
     print(f"\n[SFT] Training complete.")
-    print(f"[SFT] Runtime: {trainer_stats.metrics.get('train_runtime', 0):.0f}s")
+    print(f"[SFT] Runtime : {trainer_stats.metrics.get('train_runtime', 0):.0f}s")
     print(f"[SFT] Final loss: {trainer_stats.metrics.get('train_loss', 0):.4f}")
 
     # ------------------------------------------------------------------
-    # 6. Save LoRA adapter
+    # 6. Save loss curve (REQUIRED by judges)
+    # ------------------------------------------------------------------
+    print(f"\n[SFT] Saving loss curve to {LOSS_PLOT_PATH}...")
+    save_loss_plot(trainer.state.log_history, LOSS_PLOT_PATH)
+
+    # ------------------------------------------------------------------
+    # 7. Save LoRA adapter
     # ------------------------------------------------------------------
     print(f"\n[SFT] Saving LoRA adapter to {OUTPUT_DIR}...")
     model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"[SFT] Adapter saved. Load with: LLMAgent(model_name='{OUTPUT_DIR}')")
+    print(f"[SFT] Adapter saved.")
 
     # ------------------------------------------------------------------
-    # 7. Optional: push to HuggingFace Hub
+    # 8. Optional HF Hub push
     # ------------------------------------------------------------------
     hf_repo = os.environ.get("HF_REPO_ID", "")
     if hf_repo:
@@ -251,16 +290,11 @@ def train():
         tokenizer.push_to_hub(hf_repo)
         print("[SFT] Push complete.")
     else:
-        print("\n[SFT] Tip: set HF_REPO_ID env var to push the adapter to HuggingFace Hub.")
-        print("[SFT] Example: HF_REPO_ID=your-username/kaizen-os-sft python training/sft_train.py")
+        print("\n[SFT] Tip: set HF_REPO_ID to push to HuggingFace Hub.")
 
     return OUTPUT_DIR
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     output_path = train()
-    print(f"\n[SFT] Done. Next step: run training/grpo_train.py with MODEL_PATH={output_path}")
+    print(f"\n[SFT] Done. Next: python training/grpo_train.py")
