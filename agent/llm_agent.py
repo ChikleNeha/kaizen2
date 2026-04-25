@@ -125,6 +125,7 @@ class LLMAgent:
         return model, tokenizer
 
     def _load_with_transformers(self):
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig  # type: ignore
 
         bnb_config = None
@@ -150,7 +151,7 @@ class LLMAgent:
             self.model_name,
             quantization_config=bnb_config,
             device_map="auto",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=self.torch.float16 if self.torch.cuda.is_available() else self.torch.float32,
             trust_remote_code=True,
         )
         model.eval()
@@ -305,7 +306,7 @@ class LLMAgent:
 
         # apply_chat_template may return a BatchEncoding dict or a raw tensor
         # depending on the transformers version — handle both
-        if isinstance(tokenized, torch.Tensor):
+        if isinstance(tokenized, self.torch.Tensor):
             input_ids = tokenized
         else:
             input_ids = tokenized["input_ids"]  # unwrap BatchEncoding
@@ -317,7 +318,7 @@ class LLMAgent:
 
         t0 = time.time()
 
-        with torch.inference_mode():
+        with self.torch.inference_mode():
             output_ids = self.model.generate(
                 input_ids,
                 max_new_tokens=self.max_new_tokens,
