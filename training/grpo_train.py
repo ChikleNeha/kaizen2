@@ -62,17 +62,17 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 MODEL_PATH      = os.environ.get("KAIZEN_SFT_PATH", "./kaizen_sft_model")
-GROUP_SIZE      = 4          # G — number of completions per prompt
+GROUP_SIZE      = 6          # G — number of completions per prompt
 MAX_NEW_TOKENS  = 256        # max tokens the policy generates per completion
-KL_COEF         = 0.1
-LEARNING_RATE   = 5e-6
-MAX_STEPS       = 80
+KL_COEF         = 0.05
+LEARNING_RATE   = 3e-6
+MAX_STEPS       = 150
 OUTPUT_DIR      = "./kaizen_grpo_model"
 BATCH_SIZE      = 1
 GRAD_ACCUM      = 4
 SEED            = 42
 
-SAVE_STEPS       = 20
+SAVE_STEPS       = 30
 SAVE_TOTAL_LIMIT = 4
 
 CHECKPOINT_DIR   = os.path.join(OUTPUT_DIR, "checkpoints")
@@ -446,6 +446,8 @@ def train():
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
         gradient_checkpointing=True,
+        warmup_steps=10,              # add this — stabilizes early training
+        max_grad_norm=0.5, 
     )
 
     # ------------------------------------------------------------------
