@@ -42,6 +42,8 @@ import os
 # HF Spaces injects secrets as environment variables automatically
 # No special client needed — just os.environ.get()
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 if HF_TOKEN:
     # Log in to HF Hub so private repos and gated models are accessible
@@ -54,8 +56,6 @@ if HF_TOKEN:
 else:
     logger.warning("[Server] HF_TOKEN not set — only public HF repos accessible")
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Lazy model + env loading
