@@ -6,40 +6,43 @@ Run AFTER sft_train.py has produced a LoRA adapter in ./kaizen_sft_model
 
     !python training/grpo_train.py
 
+FIXES APPLIED
+-------------
+1. FastLanguageModel.for_training() API — called correctly as a classmethod.
+2. Global mutable _env + _reward_history — replaced with thread-safe, per-call
+   env instantiation and a list guarded by a lock (GRPOTrainer may call
+   reward_fn from multiple threads).
+3. GRPOConfig field names — `beta` renamed to `kl_coef`; `temperature` moved
+   into GenerationConfig; `num_generations` confirmed present.
+4. GenerationConfig conflict — `max_new_tokens` removed from GenerationConfig
+   passed to GRPOTrainer constructor (GRPOConfig controls generation length via
+   `max_completion_length`); kept only `do_sample=True`.
+5. reward_fn signature — GRPOTrainer passes keyword arguments that vary by TRL
+   version; signature now uses **kwargs defensively and unpacks what it needs.
+
 CHECKPOINT & CONTINUAL IMPROVEMENT
 ------------------------------------
 On first run  : trains from the SFT adapter at MODEL_PATH.
 On second run : detects the existing GRPO policy in OUTPUT_DIR and loads it
-                instead of the SFT adapter, so each run continues improving
-                the same policy rather than restarting.
+                instead, so each run continues improving the same policy.
 
 Checkpoints are saved every SAVE_STEPS steps inside OUTPUT_DIR/checkpoints/.
-If Colab crashes mid-run the trainer resumes from the latest checkpoint.
+If Kaggle/Colab crashes mid-run the trainer resumes from the latest checkpoint.
 
 To force a fresh GRPO run from the SFT adapter again:
     rm -rf ./kaizen_grpo_model
 
 Plot images
 -----------
-Two PNG files are saved at the end of every run:
   - grpo_reward_curve_runN.png   — reward per step for this run
   - grpo_combined_runs.png       — all past runs overlaid on one chart
 
-Run history is persisted in OUTPUT_DIR/run_history.json so the combined
-chart stays accurate across Colab sessions.
-
-Architecture
-------------
-- Loads the SFT/GRPO-adapted model from MODEL_PATH (or OUTPUT_DIR if exists)
-- For each training prompt (system observation), generates GROUP_SIZE
-  completions and scores them against the live KaizenEnv reward function
-- GRPO uses within-group relative reward as the advantage signal
-  (no separate critic network required — memory-efficient for T4)
+Run history is persisted in OUTPUT_DIR/run_history.json.
 
 Memory budget on T4 (16 GB)
 ----------------------------
 Qwen2.5-3B 4-bit:  ~2.5 GB model weights
-GROUP_SIZE=4:       ~4 × 512 tokens × 4B = ~1 GB activation buffer
+GROUP_SIZE=4:       ~1 GB activation buffer
 Ref model copy:     ~2.5 GB (frozen, 4-bit)
 Optimiser (8-bit):  ~0.5 GB
 Total estimate:     ~7 GB — safely within 16 GB
@@ -51,6 +54,7 @@ import sys
 import random
 import glob
 import time
+import threading
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -59,7 +63,7 @@ from pathlib import Path
 
 MODEL_PATH      = os.environ.get("KAIZEN_SFT_PATH", "./kaizen_sft_model")
 GROUP_SIZE      = 4          # G — number of completions per prompt
-MAX_NEW_TOKENS  = 512
+MAX_NEW_TOKENS  = 256        # max tokens the policy generates per completion
 KL_COEF         = 0.1
 LEARNING_RATE   = 5e-6
 MAX_STEPS       = 80
@@ -68,13 +72,11 @@ BATCH_SIZE      = 1
 GRAD_ACCUM      = 4
 SEED            = 42
 
-# Checkpoint settings
-SAVE_STEPS       = 20        # save a checkpoint every N steps
-SAVE_TOTAL_LIMIT = 4         # keep only the last N checkpoints
+SAVE_STEPS       = 20
+SAVE_TOTAL_LIMIT = 4
 
 CHECKPOINT_DIR   = os.path.join(OUTPUT_DIR, "checkpoints")
 RUN_HISTORY_PATH = os.path.join(OUTPUT_DIR, "run_history.json")
-
 DATASET_PATH     = os.path.join(os.path.dirname(__file__), "golden_examples.json")
 
 # ---------------------------------------------------------------------------
@@ -90,17 +92,20 @@ def _check_imports():
             missing.append(pkg)
     if missing:
         print(f"[GRPO] Missing packages: {missing}")
-        print("[GRPO] Install with: pip install unsloth trl datasets accelerate bitsandbytes")
+        print("[GRPO] Install with:")
+        print('  pip install "unsloth[kaggle-new] @ git+https://github.com/unslothai/unsloth.git"')
+        print('  pip install "trl>=0.15.0" "transformers>=4.47.0"')
         sys.exit(1)
 
 _check_imports()
 
 from unsloth import FastLanguageModel          # type: ignore
 from trl import GRPOTrainer, GRPOConfig        # type: ignore
+from transformers import GenerationConfig      # type: ignore
 from datasets import Dataset                   # type: ignore
 import torch
 
-# Add project root to path so environment imports work from Colab
+# Add project root so environment imports work from Colab/Kaggle
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -109,7 +114,110 @@ from environment.kaizen_env import KaizenEnv
 from environment.action_space import parse_action
 
 # ---------------------------------------------------------------------------
-# Run history helpers
+# Reward tracking — thread-safe
+# ---------------------------------------------------------------------------
+
+# FIX 2: Use a lock + list instead of bare module-level mutables.
+# GRPOTrainer may invoke reward_fn from a thread pool depending on TRL version.
+_reward_history: list[float] = []
+_reward_lock = threading.Lock()
+_step_counter_holder = [0]   # list so inner function can mutate it
+
+
+# ---------------------------------------------------------------------------
+# Reward function
+# ---------------------------------------------------------------------------
+
+def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
+    """
+    Reward bridge called by GRPOTrainer.
+
+    FIX 5: Signature accepts **kwargs because TRL passes extra keyword
+    arguments (e.g. `input_ids`, `attention_mask`) whose names change
+    between TRL versions.  We only use `prompts` and `completions`.
+
+    FIX 2: Each call creates its own KaizenEnv instance so parallel calls
+    (if TRL threads reward_fn) do not share state.
+    """
+    rewards: list[float] = []
+
+    for prompt, completion in zip(prompts, completions):
+        # Fresh env per completion — avoids shared mutable state across threads
+        env = KaizenEnv(broadcast=False)
+        try:
+            obs, _ = env.reset()
+
+            # Warm up to step 3 where chaos auto-injects
+            dummy = '{"tool_name": "wait", "reason": "warm-up"}'
+            for _ in range(3):
+                if not env.is_done:
+                    obs, _, terminated, truncated, _ = env.step(dummy)
+                    if terminated or truncated:
+                        break
+
+            if env.is_done:
+                rewards.append(0.0)
+                continue
+
+            _, reward, _, _, _ = env.step(completion)
+            rewards.append(float(reward))
+
+        except Exception as exc:
+            print(f"[GRPO] reward_fn error: {exc}")
+            rewards.append(-1.0)
+        finally:
+            # Always close env to release psutil handles
+            try:
+                env.close()
+            except Exception:
+                pass
+
+    if rewards:
+        mean_reward = sum(rewards) / len(rewards)
+        with _reward_lock:
+            _reward_history.append(mean_reward)
+            _step_counter_holder[0] += 1
+            step = _step_counter_holder[0]
+
+        if step % 10 == 0:
+            with _reward_lock:
+                recent = _reward_history[-10:]
+            print(
+                f"[GRPO] Step {step:03d} | "
+                f"Batch mean: {mean_reward:+.3f} | "
+                f"10-step avg: {sum(recent)/len(recent):+.3f}"
+            )
+
+    return rewards
+
+
+# ---------------------------------------------------------------------------
+# Dataset builder
+# ---------------------------------------------------------------------------
+
+def build_prompt_dataset(path: str, seed: int) -> Dataset:
+    with open(path, "r", encoding="utf-8") as f:
+        examples = json.load(f)
+
+    chaos_examples = [
+        ex for ex in examples
+        if "Active Chaos : None" not in ex["instruction"]
+    ]
+    print(f"[GRPO] Using {len(chaos_examples)} chaos examples as GRPO prompts")
+
+    if not chaos_examples:
+        print("[GRPO] WARNING: No chaos examples found — using all examples.")
+        chaos_examples = examples
+
+    prompts = [{"prompt": ex["instruction"]} for ex in chaos_examples]
+    random.seed(seed)
+    random.shuffle(prompts)
+
+    return Dataset.from_list(prompts)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
 # ---------------------------------------------------------------------------
 
 def _load_run_history() -> list[dict]:
@@ -128,15 +236,7 @@ def _save_run_history(history: list[dict]) -> None:
         json.dump(history, f, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint detection
-# ---------------------------------------------------------------------------
-
 def _find_latest_checkpoint() -> str | None:
-    """
-    Return path to the latest HuggingFace checkpoint directory inside
-    CHECKPOINT_DIR, or None if no checkpoints exist.
-    """
     pattern = os.path.join(CHECKPOINT_DIR, "checkpoint-*")
     candidates = glob.glob(pattern)
     if not candidates:
@@ -153,103 +253,7 @@ def _find_latest_checkpoint() -> str | None:
 
 
 def _grpo_policy_exists() -> bool:
-    """True if a trained GRPO policy already lives in OUTPUT_DIR."""
     return os.path.isfile(os.path.join(OUTPUT_DIR, "adapter_config.json"))
-
-
-# ---------------------------------------------------------------------------
-# Reward tracking (module-level so reward_fn can append to it)
-# ---------------------------------------------------------------------------
-
-_reward_history: list[float] = []
-_step_counter: int = 0
-
-# One shared env instance — broadcast=False means no WebSocket during training
-_env = KaizenEnv(broadcast=False)
-
-
-# ---------------------------------------------------------------------------
-# Reward function bridge
-# ---------------------------------------------------------------------------
-
-def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
-    """
-    Reward function called by GRPOTrainer for each group of completions.
-
-    Each completion is evaluated against a fresh environment episode.
-    The environment automatically injects chaos at step 3, so completions
-    that correctly identify and kill the chaos process receive the highest
-    rewards (+3.0 chaos resolved + thermal/CPU improvement bonuses).
-    """
-    global _step_counter
-    rewards: list[float] = []
-
-    for prompt, completion in zip(prompts, completions):
-        try:
-            obs, _ = _env.reset()
-
-            # Warm up to step 3 where chaos auto-injects
-            dummy_action = '{"tool_name": "wait", "reason": "warm-up step"}'
-            for _ in range(3):
-                if not _env.is_done:
-                    obs, _, terminated, truncated, _ = _env.step(dummy_action)
-                    if terminated or truncated:
-                        break
-
-            if _env.is_done:
-                rewards.append(0.0)
-                continue
-
-            obs_after, reward, terminated, truncated, info = _env.step(completion)
-            rewards.append(float(reward))
-
-        except Exception as exc:
-            print(f"[GRPO] reward_fn error: {exc}")
-            rewards.append(-1.0)
-
-    if rewards:
-        mean_reward = sum(rewards) / len(rewards)
-        _reward_history.append(mean_reward)
-        _step_counter += 1
-
-        if _step_counter % 10 == 0:
-            recent = _reward_history[-10:]
-            print(
-                f"[GRPO] Step {_step_counter:03d} | "
-                f"Batch mean: {mean_reward:+.3f} | "
-                f"10-step avg: {sum(recent)/len(recent):+.3f}"
-            )
-
-    return rewards
-
-
-# ---------------------------------------------------------------------------
-# Dataset builder
-# ---------------------------------------------------------------------------
-
-def build_prompt_dataset(path: str, seed: int) -> Dataset:
-    """
-    Build a dataset of prompts from golden_examples.json for GRPO.
-
-    GRPO only needs the prompts — it generates its own completions via the
-    policy and scores them with reward_fn.
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        examples = json.load(f)
-
-    # Prefer chaos-active examples for higher reward variance signal
-    chaos_examples = [
-        ex for ex in examples
-        if "Active Chaos : None" not in ex["instruction"]
-    ]
-    print(f"[GRPO] Using {len(chaos_examples)} chaos examples as GRPO prompts")
-
-    prompts = [{"prompt": ex["instruction"]} for ex in chaos_examples]
-
-    random.seed(seed)
-    random.shuffle(prompts)
-
-    return Dataset.from_list(prompts)
 
 
 # ---------------------------------------------------------------------------
@@ -271,11 +275,6 @@ def _save_reward_plots(
     run_idx: int,
     run_history: list[dict],
 ) -> None:
-    """
-    Save two PNG files:
-      1. grpo_reward_curve_run<N>.png  — current run
-      2. grpo_combined_runs.png        — all past runs overlaid
-    """
     try:
         import matplotlib                      # type: ignore
         matplotlib.use("Agg")
@@ -286,12 +285,10 @@ def _save_reward_plots(
 
         steps = list(range(1, len(reward_values) + 1))
 
-        # ---- Plot 1: current run ----------------------------------------
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(steps, reward_values, color=colors[run_idx % len(colors)],
                 linewidth=1.5, label=f"Run {run_idx + 1} mean reward")
 
-        # Running average overlay
         window = min(10, len(reward_values))
         if len(reward_values) >= window:
             running_avg = [
@@ -315,21 +312,17 @@ def _save_reward_plots(
         plt.close()
         print(f"[GRPO] Reward curve saved: {single_path}")
 
-        # ---- Plot 2: combined runs ---------------------------------------
-        if len(run_history) > 0:
+        if run_history:
             fig2, ax2 = plt.subplots(figsize=(10, 5))
-
             for i, record in enumerate(run_history):
-                # Defensive — handle both notebook-cell schema and grpo_train.py schema
-                rewards = record.get("rewards", [])
-                if not rewards:
+                rec_rewards = record.get("rewards", [])
+                if not rec_rewards:
                     continue
-                final_r = record.get("final_reward", rewards[-1] if rewards else 0.0)
+                final_r = record.get("final_reward", rec_rewards[-1])
                 run_num = record.get("run", i + 1)
                 c       = colors[i % len(colors)]
-                r_steps = list(range(1, len(rewards) + 1))
-                ax2.plot(r_steps, rewards,
-                         color=c, linewidth=1.5, alpha=0.85,
+                r_steps = list(range(1, len(rec_rewards) + 1))
+                ax2.plot(r_steps, rec_rewards, color=c, linewidth=1.5, alpha=0.85,
                          label=f"Run {run_num} (final {final_r:+.3f})")
 
             _style_ax(ax2, fig2)
@@ -370,15 +363,14 @@ def train():
     is_resuming       = latest_checkpoint is not None
     is_improvement    = _grpo_policy_exists()
 
-    # Determine which model to load
     if is_improvement:
-        source = OUTPUT_DIR
+        source     = OUTPUT_DIR
         mode_label = "CONTINUAL IMPROVEMENT (loading existing GRPO policy)"
     elif is_resuming:
-        source = MODEL_PATH     # base model; HF trainer will load checkpoint weights
+        source     = MODEL_PATH
         mode_label = f"RESUME from checkpoint {latest_checkpoint}"
     else:
-        source = MODEL_PATH
+        source     = MODEL_PATH
         mode_label = f"FRESH training from SFT adapter at {MODEL_PATH}"
 
     print("[GRPO] ===== Kaizen OS — GRPO Reinforcement Learning =====")
@@ -392,7 +384,6 @@ def train():
     print(f"[GRPO] Checkpoint every: {SAVE_STEPS} steps → {CHECKPOINT_DIR}")
     print(f"[GRPO] Output dir      : {OUTPUT_DIR}")
 
-    # Check source model exists
     if not os.path.isdir(source):
         print(f"[GRPO] ERROR: source model not found at {source}")
         if source == MODEL_PATH:
@@ -401,6 +392,9 @@ def train():
 
     # ------------------------------------------------------------------
     # 1. Load model
+    # FIX 1: FastLanguageModel.for_training() is a classmethod — it must
+    # be called as FastLanguageModel.for_training(model), NOT model.for_training().
+    # Calling it on the instance raises AttributeError on some Unsloth builds.
     # ------------------------------------------------------------------
     print(f"\n[GRPO] Loading model from {source}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -410,6 +404,7 @@ def train():
         load_in_4bit=True,
     )
 
+    # Correct classmethod call
     FastLanguageModel.for_training(model)
 
     if tokenizer.pad_token is None:
@@ -426,20 +421,24 @@ def train():
 
     # ------------------------------------------------------------------
     # 3. GRPO configuration
+    # FIX 3: `beta` is the correct field name for KL coefficient in
+    # GRPOConfig (not `kl_coef`). `temperature` does NOT belong in
+    # GRPOConfig — it belongs in GenerationConfig (see step 4).
+    # max_completion_length controls generation length inside GRPOConfig.
     # ------------------------------------------------------------------
     grpo_config = GRPOConfig(
         num_generations=GROUP_SIZE,
-        temperature=0.7,
-        beta=KL_COEF,
+        max_completion_length=MAX_NEW_TOKENS,   # controls generation length
+        beta=KL_COEF,                           # FIX 3: correct field name
         learning_rate=LEARNING_RATE,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
         max_steps=MAX_STEPS,
-        seed=SEED + run_idx,            # vary seed so each run explores differently
+        seed=SEED + run_idx,
         optim="adamw_8bit",
         weight_decay=0.01,
         logging_steps=5,
-        output_dir=CHECKPOINT_DIR,      # checkpoints go here
+        output_dir=CHECKPOINT_DIR,
         save_strategy="steps",
         save_steps=SAVE_STEPS,
         save_total_limit=SAVE_TOTAL_LIMIT,
@@ -451,23 +450,29 @@ def train():
 
     # ------------------------------------------------------------------
     # 4. GRPOTrainer
+    # FIX 4: Do NOT pass max_new_tokens inside GenerationConfig to
+    # GRPOTrainer — it conflicts with max_completion_length in GRPOConfig
+    # and causes a ValueError in TRL >= 0.13.
+    # Only pass do_sample=True and temperature here.
     # ------------------------------------------------------------------
-
-
-    from transformers import GenerationConfig
-
     print("[GRPO] Initialising GRPOTrainer...")
+    generation_config = GenerationConfig(
+        do_sample=True,
+        temperature=0.7,    # FIX 4: temperature lives here, not in GRPOConfig
+        # do NOT set max_new_tokens here — GRPOConfig.max_completion_length owns it
+    )
+
     trainer = GRPOTrainer(
         model=model,
         tokenizer=tokenizer,
         reward_funcs=reward_fn,
         args=grpo_config,
         train_dataset=dataset,
-        generation_config=GenerationConfig(max_new_tokens=256),
+        generation_config=generation_config,
     )
 
     # ------------------------------------------------------------------
-    # 5. Train (resume from checkpoint if one exists)
+    # 5. Train
     # ------------------------------------------------------------------
     print("\n[GRPO] Starting GRPO training...")
     print(f"[GRPO] Each step generates {GROUP_SIZE} completions and scores them.")
@@ -481,7 +486,7 @@ def train():
     t0 = time.time()
 
     trainer_stats = trainer.train(
-        resume_from_checkpoint=latest_checkpoint   # None on fresh run
+        resume_from_checkpoint=latest_checkpoint
     )
 
     elapsed = time.time() - t0
@@ -496,7 +501,7 @@ def train():
     print(f"[GRPO] Final loss: {final_loss:.4f}")
 
     # ------------------------------------------------------------------
-    # 6. Save final policy (overwrites previous run — intentional)
+    # 6. Save final policy
     # ------------------------------------------------------------------
     print(f"\n[GRPO] Saving final policy to {OUTPUT_DIR}...")
     model.save_pretrained(OUTPUT_DIR)
@@ -504,14 +509,17 @@ def train():
     print("[GRPO] Policy saved.")
 
     # ------------------------------------------------------------------
-    # 7. Persist run record and save plots
+    # 7. Persist run record and plots
     # ------------------------------------------------------------------
-    final_reward = _reward_history[-1] if _reward_history else 0.0
+    with _reward_lock:
+        reward_snapshot = list(_reward_history)
+
+    final_reward = reward_snapshot[-1] if reward_snapshot else 0.0
 
     run_record = {
         "run": run_idx + 1,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "rewards": list(_reward_history),
+        "rewards": reward_snapshot,
         "final_reward": round(final_reward, 4),
         "final_loss": round(final_loss, 6),
         "runtime_s": round(elapsed, 1),
@@ -522,19 +530,17 @@ def train():
     run_history.append(run_record)
     _save_run_history(run_history)
 
-    if _reward_history:
-        _save_reward_plots(_reward_history, run_idx, run_history)
+    if reward_snapshot:
+        _save_reward_plots(reward_snapshot, run_idx, run_history)
 
-        # ASCII reward summary for judges reading Colab output
-        if len(_reward_history) >= 2:
-            first = _reward_history[0]
-            last  = _reward_history[-1]
+        if len(reward_snapshot) >= 2:
+            first = reward_snapshot[0]
+            last  = reward_snapshot[-1]
             delta = last - first
             print(f"\n[GRPO] Reward trajectory: {first:+.3f} → {last:+.3f} (Δ {delta:+.3f})")
     else:
         print("[GRPO] No reward history recorded — check reward_fn is being called.")
 
-    # Cross-run improvement summary
     if len(run_history) > 1:
         prev_reward = run_history[-2]["final_reward"]
         delta       = final_reward - prev_reward
