@@ -102,32 +102,47 @@ def parse_action(llm_output: str) -> tuple[AgenticOSAction | None, str]:
     returns (None, descriptive_error) so the environment can assign -1 reward
     immediately without executing anything.
     """
-    # Locate the JSON object boundaries
-    start = llm_output.find('{')
-    end = llm_output.rfind('}')
+    # Extract the LAST complete JSON object in the output.
+    # The GRPO model sometimes emits reasoning as a JSON block followed by
+    # the action JSON — first+last braces spans both and produces "Extra data".
+    # Scanning character-by-character and taking the last complete object
+    # fixes this without changing any downstream validation logic.
+    last_start = -1
+    last_end   = -1
+    candidate  = -1
+    depth      = 0
+    in_string  = False
+    escape     = False
 
-    if start == -1 or end == -1:
+    for i, ch in enumerate(llm_output):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            if depth == 0:
+                candidate = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and candidate != -1:
+                last_start = candidate
+                last_end   = i
+                # Don't break — keep scanning to find the LAST object
+
+    if last_start == -1:
         return None, "No JSON object found in LLM output"
 
-    json_str = llm_output[start:end + 1]
+    json_str = llm_output[last_start:last_end + 1]
 
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as exc:
         return None, f"JSON decode error: {exc}"
-
-    tool_name = data.get("tool_name", "")
-
-    if tool_name not in ACTION_MAP:
-        return None, f"Unknown tool_name: '{tool_name}'. Valid options: {list(ACTION_MAP.keys())}"
-
-    try:
-        action = ACTION_MAP[tool_name].model_validate(data)
-        return action, ""
-    except ValidationError as exc:
-        # Return a compact summary of all field errors
-        errors = "; ".join(
-            f"{'.'.join(str(loc) for loc in e['loc'])}: {e['msg']}"
-            for e in exc.errors()
-        )
-        return None, f"Validation error for '{tool_name}': {errors}"

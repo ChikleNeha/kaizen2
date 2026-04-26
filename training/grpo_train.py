@@ -320,12 +320,17 @@ def _save_reward_plots(
             fig2, ax2 = plt.subplots(figsize=(10, 5))
 
             for i, record in enumerate(run_history):
-                c = colors[i % len(colors)]
-                r_steps = list(range(1, len(record["rewards"]) + 1))
-                final_r = record["final_reward"]
-                ax2.plot(r_steps, record["rewards"],
+                # Defensive — handle both notebook-cell schema and grpo_train.py schema
+                rewards = record.get("rewards", [])
+                if not rewards:
+                    continue
+                final_r = record.get("final_reward", rewards[-1] if rewards else 0.0)
+                run_num = record.get("run", i + 1)
+                c       = colors[i % len(colors)]
+                r_steps = list(range(1, len(rewards) + 1))
+                ax2.plot(r_steps, rewards,
                          color=c, linewidth=1.5, alpha=0.85,
-                         label=f"Run {i+1} (final {final_r:+.3f})")
+                         label=f"Run {run_num} (final {final_r:+.3f})")
 
             _style_ax(ax2, fig2)
             ax2.set_xlabel("Training step", color="#888888")

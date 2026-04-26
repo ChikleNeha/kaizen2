@@ -68,7 +68,7 @@ class LLMAgent:
         self._consecutive_failures: int = 0
 
         import torch
-        self._torch = torch
+        self.torch = torch
 
         print(f"[LLMAgent] Loading model: {self.model_name}")
         print(f"[LLMAgent] max_new_tokens={max_new_tokens} | temperature={temperature}")
@@ -179,18 +179,17 @@ class LLMAgent:
         repaired.  The caller always falls back to parse_action() with
         whatever string is returned.
         """
-        start = llm_output.find('{')
-        end   = llm_output.rfind('}')
+        # Try last complete JSON object first (handles multiple JSON blocks)
+        json_str = self._extract_last_json(llm_output)
 
-        # Attempt to close truncated JSON
-        if start != -1 and end == -1:
-            llm_output = llm_output + '"}'
-            end = llm_output.rfind('}')
-
-        if start == -1 or end == -1:
-            return llm_output
-
-        json_str = llm_output[start:end + 1]
+        # If nothing found, try closing a truncated JSON
+        if not json_str:
+            start = llm_output.rfind('{')
+            if start != -1:
+                llm_output = llm_output + '"}'
+                json_str = llm_output[start:] 
+            else:
+                return llm_output
 
         try:
             data = json.loads(json_str)
@@ -269,6 +268,50 @@ class LLMAgent:
 
         repaired_json = json.dumps(data)
         return llm_output[:start] + repaired_json + llm_output[end + 1:]
+    
+    def _extract_last_json(self, text: str) -> str:
+        """
+        Extract the LAST complete JSON object from text.
+        
+        Handles the case where the model outputs multiple JSON blocks —
+        e.g. reasoning as JSON followed by the action JSON. We always
+        want the LAST one since that is the action.
+        
+        Returns empty string if no complete object found.
+        """
+        last_start = -1
+        last_end   = -1
+        depth      = 0
+        in_string  = False
+        escape     = False
+
+        for i, ch in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if ch == '\\' and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                if depth == 0:
+                    candidate_start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    # Complete object found — record it and keep scanning
+                    # so we end up with the LAST one
+                    last_start = candidate_start
+                    last_end   = i
+
+        if last_start == -1 or last_end == -1:
+            return ""
+        return text[last_start:last_end + 1]
 
     # ------------------------------------------------------------------
     # Inference
