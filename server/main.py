@@ -310,115 +310,13 @@ async def _run_episode_task() -> None:
 
 
 def _load_agent():
-    """
-    Synchronous agent loader — runs in a thread executor.
-
-    Priority order:
-      1. KAIZEN_DEMO_MODE=true    → DemoAgent (instant, no model)
-      2. Local path exists        → load from /app/kaizen_grpo_model
-      3. KAIZEN_MODEL_NAME set    → load from HF Hub
-      4. Any exception            → fall back to DemoAgent with warning
-    """
     demo_mode = os.environ.get("KAIZEN_DEMO_MODE", "false").lower() == "true"
     if demo_mode:
         from agent.demo_agent import DemoAgent
         return DemoAgent()
 
-    local_path = os.environ.get("KAIZEN_MODEL_PATH", "/app/kaizen_grpo_model")
-    model_name = os.environ.get("KAIZEN_MODEL_NAME", "")
-
-    def model_valid(path):
-        if not os.path.isdir(path):
-            return False
-        return any(
-            os.path.exists(os.path.join(path, f))
-            for f in ["adapter_config.json", "config.json",
-                      "model.safetensors", "pytorch_model.bin"]
-        )
-
-    # Decide source
-    if model_valid(local_path):
-        source = local_path
-        logger.info(f"[Server] Using local model: {source}")
-    elif model_name:
-        source = model_name
-        logger.info(f"[Server] Using HF Hub model: {source}")
-    else:
-        logger.warning("[Server] No model configured — using DemoAgent")
-        from agent.demo_agent import DemoAgent
-        return DemoAgent()
-
-    try:
-        import json
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel, PeftConfig
-
-        # ── Read adapter_config to find base model ────────────────────
-        # Works whether source is a local path or HF Hub repo ID
-        logger.info("[Server] Reading adapter config...")
-        peft_config = PeftConfig.from_pretrained(source)
-        base_model_id = peft_config.base_model_name_or_path
-        logger.info(f"[Server] Base model: {base_model_id}")
-
-        # ── Load tokenizer from adapter repo ─────────────────────────
-        logger.info("[Server] Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            source,
-            trust_remote_code=True,
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        # ── Load base model — CPU safe, no bitsandbytes ───────────────
-        # HF Spaces are CPU-only — no 4-bit quantization available.
-        # float32 is safest on CPU. Slow but correct.
-        logger.info("[Server] Loading base model on CPU (this takes 1-2 min)...")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_id,
-            dtype=torch.float32,        # CPU safe — no float16 on CPU
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-
-        # ── Apply LoRA adapter on top of base model ───────────────────
-        logger.info("[Server] Applying LoRA adapter...")
-        model = PeftModel.from_pretrained(
-            base_model,
-            source,
-            is_trainable=False,         # inference only
-        )
-        model.eval()
-
-        logger.info("[Server] LoRA model ready ✅")
-
-        # ── Manually construct LLMAgent with pre-loaded model ─────────
-        # We bypass LLMAgent.__init__ because it would try to reload
-        # the model from scratch. Instead we inject the already-loaded
-        # model and tokenizer directly.
-        from agent.llm_agent import LLMAgent
-
-        agent = object.__new__(LLMAgent)   # skip __init__
-        agent.model_name             = source
-        agent.max_new_tokens         = 256
-        agent.temperature            = 0.3
-        agent._consecutive_failures  = 0
-        agent.torch                  = torch
-        agent.model                  = model
-        agent.tokenizer              = tokenizer
-
-        device = next(model.parameters()).device
-        dtype  = next(model.parameters()).dtype
-        logger.info(f"[Server] Device: {device} | dtype: {dtype}")
-
-        return agent
-
-    except Exception as e:
-        logger.error(f"[Server] LLMAgent load failed: {e} — falling back to DemoAgent")
-        from agent.demo_agent import DemoAgent
-        return DemoAgent()
-
+    from agent.llm_agent import LLMAgent
+    return LLMAgent()
 # ---------------------------------------------------------------------------
 # GET /status
 # ---------------------------------------------------------------------------

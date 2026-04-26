@@ -22,11 +22,8 @@ RUN pip install --no-cache-dir \
     "gymnasium>=0.29.0" \
     aiofiles \
     "huggingface_hub>=0.23.0" \
-    "transformers>=4.44.0" \
-    "accelerate>=0.28.0" \
-    "peft>=0.10.0" \
-    "torch>=2.4.0" --extra-index-url https://download.pytorch.org/whl/cpu
-
+    requests
+    
 # Copy built frontend first, then project code
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 COPY . .
