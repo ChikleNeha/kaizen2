@@ -295,17 +295,49 @@ async def _run_episode_task() -> None:
 def _load_agent():
     """
     Synchronous agent loader — runs in a thread executor.
-    Set KAIZEN_DEMO_MODE=true to use the rule-based DemoAgent.
+
+    Priority order:
+      1. KAIZEN_DEMO_MODE=true       → DemoAgent (no model needed)
+      2. KAIZEN_MODEL_PATH exists    → load from local path (downloaded at build)
+      3. KAIZEN_MODEL_NAME set       → load from HF Hub identifier
+      4. Fallback                    → DemoAgent with a warning
     """
-    if os.environ.get("KAIZEN_DEMO_MODE", "false").lower() == "true":
+    demo_mode = os.environ.get("KAIZEN_DEMO_MODE", "false").lower() == "true"
+    if demo_mode:
         from agent.demo_agent import DemoAgent
         return DemoAgent()
 
-    from agent.llm_agent import LLMAgent
+    # Check if model was downloaded at build time
+    local_path  = os.environ.get("KAIZEN_MODEL_PATH", "/app/kaizen_grpo_model")
     model_name  = os.environ.get("KAIZEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
-    use_unsloth = os.environ.get("KAIZEN_USE_UNSLOTH", "true").lower() == "true"
-    return LLMAgent(model_name=model_name, use_unsloth=use_unsloth)
+    use_unsloth = os.environ.get("KAIZEN_USE_UNSLOTH", "false").lower() == "true"
 
+    # Determine which path to use
+    def model_valid(path):
+        if not os.path.isdir(path):
+            return False
+        indicators = ["adapter_config.json", "config.json",
+                      "model.safetensors", "pytorch_model.bin"]
+        return any(os.path.exists(os.path.join(path, f)) for f in indicators)
+
+    if model_valid(local_path):
+        source = local_path
+        logger.info(f"[Server] Loading model from local path: {source}")
+    elif model_name and model_name != "Qwen/Qwen2.5-3B-Instruct":
+        source = model_name
+        logger.info(f"[Server] Loading model from HF Hub: {source}")
+    else:
+        logger.warning("[Server] No trained model found — falling back to DemoAgent")
+        from agent.demo_agent import DemoAgent
+        return DemoAgent()
+
+    try:
+        from agent.llm_agent import LLMAgent
+        return LLMAgent(model_name=source, use_unsloth=use_unsloth)
+    except Exception as e:
+        logger.error(f"[Server] LLMAgent load failed: {e} — falling back to DemoAgent")
+        from agent.demo_agent import DemoAgent
+        return DemoAgent()
 
 # ---------------------------------------------------------------------------
 # GET /status
