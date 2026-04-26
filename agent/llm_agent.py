@@ -25,7 +25,7 @@ class LLMAgent:
         self.demo_mode       = False
         self._consecutive_failures = 0
 
-        self.api_url = f"https://api-inference.huggingface.co/models/{self.model_name}"
+        self.api_url = f"https://api-inference.huggingface.co/pipeline/text-generation/{self.model_name}"
         self.headers = {"Authorization": f"Bearer {os.environ.get('HF_TOKEN', '')}"}
 
         print(f"[LLMAgent] ✅ Using HF Inference API → {self.model_name}")
