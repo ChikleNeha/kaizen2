@@ -293,47 +293,85 @@ async def _run_episode_task() -> None:
 
 
 def _load_agent():
-    """
-    Synchronous agent loader — runs in a thread executor.
-
-    Priority order:
-      1. KAIZEN_DEMO_MODE=true       → DemoAgent (no model needed)
-      2. KAIZEN_MODEL_PATH exists    → load from local path (downloaded at build)
-      3. KAIZEN_MODEL_NAME set       → load from HF Hub identifier
-      4. Fallback                    → DemoAgent with a warning
-    """
     demo_mode = os.environ.get("KAIZEN_DEMO_MODE", "false").lower() == "true"
     if demo_mode:
         from agent.demo_agent import DemoAgent
         return DemoAgent()
 
-    # Check if model was downloaded at build time
     local_path  = os.environ.get("KAIZEN_MODEL_PATH", "/app/kaizen_grpo_model")
-    model_name  = os.environ.get("KAIZEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
+    model_name  = os.environ.get("KAIZEN_MODEL_NAME", "")
     use_unsloth = os.environ.get("KAIZEN_USE_UNSLOTH", "false").lower() == "true"
 
-    # Determine which path to use
     def model_valid(path):
         if not os.path.isdir(path):
             return False
-        indicators = ["adapter_config.json", "config.json",
+        return any(
+            os.path.exists(os.path.join(path, f))
+            for f in ["adapter_config.json", "config.json",
                       "model.safetensors", "pytorch_model.bin"]
-        return any(os.path.exists(os.path.join(path, f)) for f in indicators)
+        )
 
-    if model_valid(local_path):
-        source = local_path
-        logger.info(f"[Server] Loading model from local path: {source}")
-    elif model_name and model_name != "Qwen/Qwen2.5-3B-Instruct":
-        source = model_name
-        logger.info(f"[Server] Loading model from HF Hub: {source}")
-    else:
-        logger.warning("[Server] No trained model found — falling back to DemoAgent")
+    source = local_path if model_valid(local_path) else model_name
+
+    if not source:
+        logger.warning("[Server] No model found — using DemoAgent")
         from agent.demo_agent import DemoAgent
         return DemoAgent()
 
     try:
-        from agent.llm_agent import LLMAgent
-        return LLMAgent(model_name=source, use_unsloth=use_unsloth)
+        logger.info(f"[Server] Loading LLMAgent from: {source}")
+
+        # Check if this is a LoRA adapter (has adapter_config but no full model)
+        is_lora_only = (
+            os.path.exists(os.path.join(source, "adapter_config.json"))
+            and not os.path.exists(os.path.join(source, "config.json"))
+        )
+
+        if is_lora_only:
+            # Load base model then apply LoRA adapter
+            logger.info("[Server] Detected LoRA-only adapter — loading base model first")
+            import json, torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from peft import PeftModel
+
+            # Read base model name from adapter_config.json
+            adapter_cfg_path = os.path.join(source, "adapter_config.json")
+            with open(adapter_cfg_path) as f:
+                adapter_cfg = json.load(f)
+            base_model_name = adapter_cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-3B-Instruct")
+            logger.info(f"[Server] Base model: {base_model_name}")
+
+            tokenizer = AutoTokenizer.from_pretrained(source)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.float32,  # CPU — no float16
+                device_map="cpu",
+                low_cpu_mem_usage=True,
+            )
+            model = PeftModel.from_pretrained(base_model, source)
+            model.eval()
+
+            # Patch LLMAgent to use our pre-loaded model
+            from agent.llm_agent import LLMAgent
+            agent = LLMAgent.__new__(LLMAgent)
+            agent.model_name        = source
+            agent.max_new_tokens    = 256
+            agent.temperature       = 0.3
+            agent._consecutive_failures = 0
+            agent.torch             = torch
+            agent.model             = model
+            agent.tokenizer         = tokenizer
+            logger.info("[Server] LoRA adapter loaded on CPU ✅")
+            return agent
+
+        else:
+            # Full model or adapter with config — load normally
+            from agent.llm_agent import LLMAgent
+            return LLMAgent(model_name=source, use_unsloth=use_unsloth)
+
     except Exception as e:
         logger.error(f"[Server] LLMAgent load failed: {e} — falling back to DemoAgent")
         from agent.demo_agent import DemoAgent

@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The model runs in 4-bit on CPU — slow but functional for demo.
 # For fast inference use ngrok on Colab A100 instead (see README).
 RUN pip install --no-cache-dir \
+    "numpy<2" \
     fastapi>=0.110.0 \
     uvicorn>=0.29.0 \
     websockets>=12.0 \
@@ -29,11 +30,12 @@ RUN pip install --no-cache-dir \
     "pydantic>=2.0.0" \
     "gymnasium>=0.29.0" \
     aiofiles \
-    huggingface_hub \
-    transformers>=4.40.0 \
-    accelerate>=0.28.0 \
-    "torch==2.2.0" --extra-index-url https://download.pytorch.org/whl/cpu \
-    bitsandbytes
+    "huggingface_hub>=0.23.0" \
+    "transformers>=4.44.0" \
+    "accelerate>=0.28.0" \
+    "torch>=2.4.0" --extra-index-url https://download.pytorch.org/whl/cpu \
+    bitsandbytes \
+    peft
 
 # Copy project code
 COPY . .
