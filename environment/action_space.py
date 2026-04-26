@@ -146,3 +146,24 @@ def parse_action(llm_output: str) -> tuple[AgenticOSAction | None, str]:
         data = json.loads(json_str)
     except json.JSONDecodeError as exc:
         return None, f"JSON decode error: {exc}"
+    
+    # ← this continues inside parse_action, after the json.loads try/except
+
+    if not isinstance(data, dict):
+        return None, "JSON root is not an object"
+
+    tool_name = data.get("tool_name", "")
+    if not tool_name:
+        return None, "Missing 'tool_name' field in JSON"
+
+    model_cls = ACTION_MAP.get(tool_name)
+    if model_cls is None:
+        known = ", ".join(ACTION_MAP.keys())
+        return None, f"Unknown tool_name '{tool_name}'. Known tools: {known}"
+
+    try:
+        action = model_cls.model_validate(data)
+        return action, ""
+    except ValidationError as exc:
+        first_error = exc.errors()[0]
+        return None, f"Validation error in {tool_name}: {first_error['msg']} @ {first_error['loc']}"
