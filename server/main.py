@@ -37,6 +37,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from server.broadcast import manager
 
+import os
+
+# HF Spaces injects secrets as environment variables automatically
+# No special client needed — just os.environ.get()
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+if HF_TOKEN:
+    # Log in to HF Hub so private repos and gated models are accessible
+    try:
+        from huggingface_hub import login
+        login(token=HF_TOKEN, add_to_git_credential=False)
+        logger.info("[Server] HuggingFace login successful")
+    except Exception as e:
+        logger.warning(f"[Server] HuggingFace login failed: {e}")
+else:
+    logger.warning("[Server] HF_TOKEN not set — only public HF repos accessible")
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
