@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir \
     "accelerate>=0.28.0" \
     "torch>=2.4.0" --extra-index-url https://download.pytorch.org/whl/cpu \
     bitsandbytes \
-    peft
+    peft \
 
 # Copy project code
 COPY . .
